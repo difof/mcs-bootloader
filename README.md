@@ -51,9 +51,13 @@ The first-install helper consumes `.local/install.json` with `user`, `server_dir
 
 Gateway INFO logs cover state transitions, actual player-count changes, proxied connection open/close with duration and byte counts, and health recovery. Normal status pings and healthy polls are silent. Error deduplication and warning throttles prevent retries from flooding the log; aggregate counters remain available through `task status`.
 
+Health checks reuse one authenticated loopback RCON connection, avoiding Minecraft's per-connection log chatter. A broken or uncertain exchange discards that connection and fails the check; a later poll reconnects. Commands with uncertain delivery are never automatically replayed.
+
 The dedicated `mc-gateway` journald namespace has a 64 MiB persistent budget, 8 MiB file rotation, a 16 MiB runtime budget, and a 14-day retention limit. Gateway and backend events can be inspected separately by unit. The game's existing own log files retain their existing behavior.
 
 The admin API is a mode-0600 Unix socket, not a public HTTP listener. It supports status, wake, and guarded sleep only. It cannot execute arbitrary RCON commands. `task sleep` refuses occupied or unhealthy servers; it is not a force-stop command.
+
+Use `task wake` and `task sleep` to operate the installed server. Keep the original restart wrapper for rollback; running it alongside the gateway would create an unmanaged Java process outside the lifecycle controller.
 
 ## Compatibility boundaries
 
