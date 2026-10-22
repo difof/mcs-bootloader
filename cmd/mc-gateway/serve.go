@@ -49,7 +49,8 @@ func serve(cfg backend.Config) error {
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	rc := rcon.New(cfg.RCONAddress, password, time.Duration(cfg.OperationTimeout))
+	rc := rcon.NewPersistent(cfg.RCONAddress, password, time.Duration(cfg.OperationTimeout))
+	defer rc.Close()
 	b := &backend.Systemd{Service: cfg.Service, Address: cfg.BackendAddress, Protocol: cfg.Protocol, RCON: rc}
 	c := control.New(control.Config{
 		IdleTimeout: time.Duration(cfg.IdleTimeout), PollInterval: time.Duration(cfg.PollInterval), OperationTimeout: time.Duration(cfg.OperationTimeout),
