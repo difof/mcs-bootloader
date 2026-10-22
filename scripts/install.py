@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""First-install only. Validate a stopped, backed-up server before activating the gateway.
+
+Pre-activation failures restore properties and remove only this invocation's new
+files. Activation failures retain the validated installation for inspection: a
+backend might already be starting, so automatic world/config rollback is unsafe.
+"""
+
+import argparse
+import datetime
+import errno
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+FIXED_CONFIG = {
+    "listen", "backend_address", "rcon_address", "rcon_password_file",
+    "backend_service", "state_directory", "admin_socket",
+}
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def run(argv, timeout=120, allowed=(0,)):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                            env={**os.environ, "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
+    require(result.returncode in allowed,
+            f"{argv[0]} failed ({result.returncode}): {(result.stderr or result.stdout).strip()[:2000]}")
+    return result.stdout.strip()
+
+
+def safe_text(value):
+    require(isinstance(value, str) and value and not any(c in value for c in "\n\r\0"),
+            "plan strings must be nonempty and contain no line breaks or NULs")
+    return value
+
+
+def systemd_working_directory(value):
+    """Render a scalar path directive, whose outer quotes are literal characters.
+
+    Keep the supported path representation conservative; reject ambiguous unit
+    syntax instead of inventing shell-style quoting. Escape literal specifiers.
+    """
+    value = safe_text(value)
+    require(value.startswith("/") and not any(
+        c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "\\\"'" for c in value),
+        "WorkingDirectory must be absolute and contain no whitespace, quotes, backslashes, or control characters")
+    return value.replace("%", "%%")
+
+
+def updated_properties(original, password):
+    """Preserve unrelated lines byte-for-byte, including authentication settings."""
+    changes = {
+        b"server-ip": b"127.0.0.1", b"server-port": b"25566",
+        b"enable-rcon": b"true", b"rcon.port": b"25575",
+        b"rcon.password": password.encode("ascii"), b"broadcast-rcon-to-ops": b"false",
+    }
+    lines, seen = [], set()
+    newline = b"\r\n" if b"\r\n" in original else b"\n"
+    for line in original.splitlines(keepends=True):
+        body = line.rstrip(b"\r\n")
+        require((len(body) - len(body.rstrip(b"\\"))) % 2 == 0,
+                "continued property lines require manual review; nothing was changed")
+        match = re.match(rb"^[ \t\f]*([^#! \t\f:=]+)", body)
+        key = match.group(1) if match else None
+        if key in changes:
+            ending = line[len(body):]
+            lines.append(key + b"=" + changes[key] + ending)
+            seen.add(key)
+        else:
+            lines.append(line)
+    result = b"".join(lines)
+    missing = [key for key in changes if key not in seen]
+    if missing and result and not result.endswith((b"\n", b"\r")):
+        result += newline
+    return result + b"".join(key + b"=" + changes[key] + newline for key in missing)
+
+
+def write_atomic(path, data, mode, uid=0, gid=0):
+    fd, temporary = tempfile.mkstemp(prefix=".mc-gateway-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            os.fchown(stream.fileno(), uid, gid)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def stopped_and_ports_free(uid):
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid == uid:
+                name = (process / "comm").read_text().strip()
+                executable = Path(os.readlink(process / "exe")).name
+                require(name != "java" and executable != "java",
+                        f"Java is still running for the service account (PID {process.name})")
+                require(name != "startserver.sh", f"a restart launcher is still running (PID {process.name})")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    for family, address in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        for port in (25565, 25566, 25575):
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as listener:
+                    if family == socket.AF_INET6:
+                        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    listener.bind((address, port))
+            except OSError as exc:
+                if family == socket.AF_INET6 and exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                    continue
+                raise RuntimeError(f"required TCP port {port} is unavailable on {address}: {exc}") from exc
+
+
+def install(plan_path, report_path):
+    require(os.geteuid() == 0, "installer must run as root")
+    plan = json.loads(plan_path.read_text())
+    user = safe_text(plan["user"])
+    require(re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", user) is not None, "unsupported account name")
+    account = pwd.getpwnam(user)
+    require(account.pw_uid != 0, "the gateway must not run as root")
+    group = grp.getgrgid(account.pw_gid).gr_name
+    require(re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", group) is not None, "unsupported group name")
+    server_input, backup_input = Path(safe_text(plan["server_directory"])), Path(safe_text(plan["backup_directory"]))
+    require(server_input.is_absolute() and backup_input.is_absolute(), "server and backup paths must be absolute")
+    server, backup = server_input.resolve(strict=True), backup_input.resolve(strict=True)
+    require(server.is_dir() and backup.is_dir(), "server and backup paths must be directories")
+    working_directory = systemd_working_directory(str(server))
+    argfile = Path(safe_text(plan["server_argfile"]))
+    require(not argfile.is_absolute() and ".." not in argfile.parts, "server_argfile must stay relative to the server")
+    require((server / argfile).resolve(strict=True).is_relative_to(server), "server_argfile escapes the server directory")
+    require((server / argfile).is_file() and (server / "user_jvm_args.txt").is_file(),
+            "the existing loader and JVM argument files are required")
+    props, archive = server / "server.properties", backup / "world-before-gateway.tar.zst"
+    require(props.is_file() and not props.is_symlink(), "server.properties must be an ordinary file")
+    metadata = props.stat()
+    original = props.read_bytes()
+    require(metadata.st_uid == account.pw_uid, "server.properties is not owned by the selected service account")
+    require((backup / "server.properties").read_bytes() == original, "backup properties differ from the stopped server")
+    require(archive.is_file() and archive.stat().st_size > 0, "world backup is missing or empty")
+    require(not os.path.lexists(report_path), "installation report already exists; this is a first-install operation")
+    require(report_path.parent.is_dir(), "installation report directory must already exist")
+    for directory in ("/opt", "/etc", "/etc/systemd/system", "/etc/sudoers.d", "/var/lib"):
+        st = Path(directory).stat()
+        require(st.st_uid == 0 and not st.st_mode & 0o022, f"unsafe installation parent permissions: {directory}")
+    roots = [Path("/opt/mc-gateway"), Path("/etc/mc-gateway"), Path("/var/lib/mc-gateway")]
+    targets = [Path("/etc/systemd/system/mc-gateway.service"),
+               Path("/etc/systemd/system/mc-gateway-backend.service"),
+               Path("/etc/systemd/journald@mc-gateway.conf"), Path("/etc/sudoers.d/mc-gateway")]
+    for path in roots + targets + [Path("/run/mc-gateway")]:
+        require(not os.path.lexists(path), f"refusing existing installation path: {path}")
+    for unit in ("mc-gateway.service", "mc-gateway-backend.service"):
+        state = run(["/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value"], allowed=(0, 1))
+        require(state == "not-found", f"refusing existing or uninspectable unit: {unit} ({state})")
+    stopped_and_ports_free(account.pw_uid)
+    run(["/usr/bin/zstd", "--test", "--quiet", str(archive)])
+    require("world/level.dat" in run(["/usr/bin/tar", "--zstd", "--list", "--file", str(archive),
+                                    "--wildcards", "--no-anchored", "world/level.dat"]),
+            "world backup does not contain level.dat")
+    for path, permission in ((server, "-w"), (server / argfile, "-r"), (server / "user_jvm_args.txt", "-r")):
+        run(["/usr/sbin/runuser", "-u", user, "--", "/usr/bin/test", permission, str(path)])
+    config = json.loads((ROOT / "deploy/config.example.json").read_text())
+    overrides = plan.get("config", {})
+    require(isinstance(overrides, dict), "config override must be an object")
+    require(all(key not in FIXED_CONFIG or value == config[key] for key, value in overrides.items()),
+            "fixed gateway addresses, paths, and service identity cannot be overridden by the installer")
+    config.update(overrides)
+    password = secrets.token_hex(32)
+    replacement = updated_properties(original, password)
+    binary = (ROOT / "bin/mc-gateway").read_bytes()
+    require(binary.startswith(b"\x7fELF"), "bin/mc-gateway is not a built Linux executable")
+    created, directories, changed_props, reloaded = [], [], False, False
+    report = {"created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "validating",
+              "user": user, "server_directory": str(server), "backup_directory": str(backup),
+              "original_properties": {"sha256": hashlib.sha256(original).hexdigest(),
+                                      "uid": metadata.st_uid, "gid": metadata.st_gid,
+                                      "mode": oct(stat.S_IMODE(metadata.st_mode)),
+                                      "atime_ns": metadata.st_atime_ns, "mtime_ns": metadata.st_mtime_ns},
+              "binary_sha256": hashlib.sha256(binary).hexdigest(), "phase": "install files"}
+
+    def save_report():
+        write_atomic(report_path, (json.dumps(report, indent=2) + "\n").encode(), 0o600,
+                     report_path.parent.stat().st_uid, report_path.parent.stat().st_gid)
+
+    def add_file(path, data, mode=0o644, gid=0):
+        require(not os.path.lexists(path), f"installation path appeared concurrently: {path}")
+        write_atomic(path, data, mode, 0, gid)
+        created.append(path)
+
+    try:
+        for path, mode, uid, gid in ((roots[0], 0o755, 0, 0), (roots[0] / "bin", 0o755, 0, 0),
+                                     (roots[1], 0o750, 0, account.pw_gid),
+                                     (roots[2], 0o700, account.pw_uid, account.pw_gid)):
+            path.mkdir(mode=mode)
+            directories.append(path)
+            os.chown(path, uid, gid)
+            os.chmod(path, mode)
+        add_file(roots[0] / "bin/mc-gateway", binary, 0o755)
+        add_file(roots[1] / "config.json", (json.dumps(config, indent=2) + "\n").encode(), 0o640, account.pw_gid)
+        add_file(roots[1] / "rcon.password", (password + "\n").encode(), 0o640, account.pw_gid)
+        # EnvironmentFile quoting does not use systemd unit %-specifier expansion.
+        env_arg = ("@" + str(argfile)).replace("\\", "\\\\").replace('"', '\\"')
+        add_file(roots[1] / "backend.env", f'MC_SERVER_ARGFILE="{env_arg}"\n'.encode(), 0o640, account.pw_gid)
+        for destination in targets[:2]:
+            unit = (ROOT / "deploy" / destination.name).read_text()
+            require(unit.count("User=minecraft\n") == 1 and unit.count("Group=minecraft\n") == 1,
+                    "service template account markers changed; review installer")
+            unit = unit.replace("User=minecraft\n", f"User={user}\n").replace("Group=minecraft\n", f"Group={group}\n")
+            unit = unit.replace("WorkingDirectory=/srv/minecraft\n", f"WorkingDirectory={working_directory}\n")
+            add_file(destination, unit.encode())
+        add_file(targets[2], (ROOT / "deploy/journald@mc-gateway.conf").read_bytes())
+        sudoers = f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl start mc-gateway-backend.service\n".encode()
+        with tempfile.TemporaryDirectory(prefix="mc-gateway-sudoers-") as temporary:
+            staged = Path(temporary) / "rule"
+            staged.write_bytes(sudoers)
+            staged.chmod(0o440)
+            run(["/usr/sbin/visudo", "-cf", str(staged)])
+        add_file(targets[3], sudoers, 0o440)
+        report["phase"] = "validate installed units and configuration"
+        run(["/usr/bin/systemd-analyze", "verify", str(targets[0]), str(targets[1])])
+        run(["/usr/sbin/runuser", "-u", user, "--", str(roots[0] / "bin/mc-gateway"),
+             "check", "--config", str(roots[1] / "config.json")])
+        report["phase"] = "update stopped server properties"
+        stopped_and_ports_free(account.pw_uid)
+        require(props.read_bytes() == original, "server.properties changed during validation")
+        write_atomic(props, replacement, 0o640, metadata.st_uid, metadata.st_gid)
+        changed_props = True
+        report["properties_sha256"] = hashlib.sha256(replacement).hexdigest()
+        report["installed_files"] = [str(path) for path in created]
+        report["phase"] = "reload validated units"
+        run(["/usr/bin/systemctl", "daemon-reload"])
+        reloaded = True
+        stopped_and_ports_free(account.pw_uid)
+        report["status"], report["phase"] = "validated", "before activation"
+        save_report()
+        report["phase"] = "activate gateway"
+        run(["/usr/bin/systemctl", "enable", "--now", "mc-gateway.service"])
+        report["status"], report["phase"] = "installed", "complete"
+        save_report()
+        print(json.dumps({"status": "installed", "gateway": "enabled", "backend": "left stopped and disabled",
+                          "report": str(report_path)}))
+    except Exception as exc:
+        failure_phase = report["phase"]
+        rollback_errors = []
+        if failure_phase != "activate gateway" and report["status"] != "installed":
+            if changed_props:
+                try:
+                    write_atomic(props, original, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid)
+                    os.utime(props, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                except Exception as rollback:
+                    rollback_errors.append(f"properties: {rollback}")
+            for path in reversed(created):
+                try:
+                    path.unlink()
+                except OSError as rollback:
+                    rollback_errors.append(f"remove {path}: {rollback}")
+            for path in reversed(directories):
+                try:
+                    path.rmdir()
+                except OSError as rollback:
+                    rollback_errors.append(f"remove empty {path}: {rollback}")
+            if reloaded:
+                try:
+                    run(["/usr/bin/systemctl", "daemon-reload"])
+                except Exception as rollback:
+                    rollback_errors.append(f"reload after rollback: {rollback}")
+        else:
+            rollback_errors.append("activation began; validated files retained for safe operator inspection")
+        report.update(status="failed", phase=failure_phase, error=str(exc), rollback_errors=rollback_errors)
+        try:
+            save_report()
+        except Exception as report_error:
+            rollback_errors.append(f"report: {report_error}")
+        raise RuntimeError(f"installation failed during {failure_phase}: {exc}; rollback notes: {rollback_errors}") from exc
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--report", type=Path, default=Path(".local/installation.json"))
+    args = parser.parse_args()
+    try:
+        install(args.plan.resolve(strict=True), args.report.absolute())
+    except Exception as failure:
+        print(f"mc-gateway install: {failure}", file=sys.stderr)
+        sys.exit(1)
