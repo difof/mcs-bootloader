@@ -1,0 +1,32 @@
+[Unit]
+Description=Minecraft sleep and wake gateway
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=minecraft
+Group=minecraft
+WorkingDirectory=/
+ExecStart=/opt/mc-gateway/bin/mc-gateway serve --config /etc/mc-gateway/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+RuntimeDirectory=mc-gateway
+RuntimeDirectoryMode=0700
+StateDirectory=mc-gateway
+StateDirectoryMode=0700
+UMask=0077
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+# A narrowly scoped sudo rule starts only the backend unit.
+# NoNewPrivileges would disable that rule.
+NoNewPrivileges=false
+LogNamespace=mc-gateway
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target
