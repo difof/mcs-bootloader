@@ -1,0 +1,10 @@
+/bin/
+/.local/
+/coverage.out
+*.test
+*.log
+*.password
+*.tar.gz
+*.tar.zst
+__pycache__/
+*.pyc
