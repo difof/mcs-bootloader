@@ -1,0 +1,24 @@
+[Unit]
+Description=Minecraft server managed by the sleep gateway
+After=network.target
+
+[Service]
+Type=exec
+User=minecraft
+Group=minecraft
+WorkingDirectory=/srv/minecraft
+EnvironmentFile=/etc/mc-gateway/backend.env
+# Use the existing JVM arguments and installed loader. No restart shell loop.
+ExecStart=/usr/bin/java @user_jvm_args.txt ${MC_SERVER_ARGFILE} nogui
+ExecStop=/opt/mc-gateway/bin/mc-gateway backend-stop --config /etc/mc-gateway/config.json --pid=${MAINPID}
+Restart=no
+TimeoutStopSec=infinity
+# If the helper fails, leave the process alive for operator recovery.
+KillSignal=SIGCONT
+SendSIGKILL=no
+KillMode=control-group
+UMask=0027
+LogNamespace=mc-gateway
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=5000
+# Intentionally no Install section: waking is explicit, not automatic at boot.
