@@ -1,5 +1,5 @@
-// Package rcon provides bounded, authenticated Minecraft RCON requests. A new
-// connection per command avoids stale authentication and shared-stream races.
+// Package rcon provides bounded, authenticated Minecraft RCON requests. Clients
+// can use single-command connections or an explicitly serialized persistent one.
 package rcon
 
 import (
@@ -24,12 +24,22 @@ const (
 	boundaryID  int32 = 3
 )
 
-var ErrAuthentication = errors.New("RCON authentication rejected")
+var (
+	ErrAuthentication = errors.New("RCON authentication rejected")
+	ErrClosed         = errors.New("RCON client is closed")
+)
 
 type Client struct {
 	address  string
 	password string
 	timeout  time.Duration
+	// Only persistent clients use the fields below. gate protects their entire
+	// exchange, connection lifecycle, request IDs, and closed flag.
+	persistent bool
+	gate       chan struct{}
+	conn       net.Conn
+	nextID     int32
+	closed     bool
 }
 
 func New(address, password string, timeout time.Duration) *Client {
@@ -37,6 +47,39 @@ func New(address, password string, timeout time.Duration) *Client {
 		timeout = 5 * time.Second
 	}
 	return &Client{address: address, password: password, timeout: timeout}
+}
+
+// NewPersistent reuses one authenticated connection for sequential requests.
+// Every failed/uncertain exchange is returned without replay and invalidates the
+// connection. A later caller can reconnect. Close releases the idle connection.
+func NewPersistent(address, password string, timeout time.Duration) *Client {
+	c := New(address, password, timeout)
+	c.persistent = true
+	c.gate = make(chan struct{}, 1)
+	return c
+}
+
+// Close is idempotent. For a persistent client it waits for the current bounded
+// exchange, closes its connection, and rejects future commands. Single-command
+// clients have no idle resources to release.
+func (c *Client) Close() error {
+	if !c.persistent {
+		return nil
+	}
+	c.gate <- struct{}{}
+	defer func() { <-c.gate }()
+	c.closed = true
+	return c.discard()
+}
+
+// discard must be called with the persistent client's gate held.
+func (c *Client) discard() error {
+	conn := c.conn
+	c.conn = nil
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
 
 type packet struct {
@@ -105,50 +148,134 @@ func (c *Client) Command(ctx context.Context, command string) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	if c.persistent {
+		return c.persistentCommand(ctx, command)
+	}
 	d := net.Dialer{}
 	conn, err := d.DialContext(ctx, "tcp", c.address)
 	if err != nil {
 		return "", fmt.Errorf("RCON connect: %w", err)
 	}
 	defer conn.Close()
-	deadline, _ := ctx.Deadline()
-	if err := conn.SetDeadline(deadline); err != nil {
+	finish, err := bindContext(ctx, conn)
+	if err != nil {
 		return "", err
 	}
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
-	defer stopCancel()
+	defer finish()
 	return c.exchange(conn, command)
+}
+
+// bindContext joins a cancellation callback before returning the connection to
+// an idle pool. An old callback must never alter a later request's deadline.
+func bindContext(ctx context.Context, conn net.Conn) (func(), error) {
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(done)
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}, nil
+}
+
+func (c *Client) persistentCommand(ctx context.Context, command string) (response string, err error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case c.gate <- struct{}{}:
+	}
+	defer func() { <-c.gate }()
+	if c.closed {
+		return "", ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	// Rotate a connection before request IDs could overflow or be reused.
+	if c.conn != nil && c.nextID > 1<<31-3 {
+		_ = c.discard()
+	}
+	fresh := c.conn == nil
+	if fresh {
+		d := net.Dialer{}
+		c.conn, err = d.DialContext(ctx, "tcp", c.address)
+		if err != nil {
+			return "", fmt.Errorf("RCON connect: %w", err)
+		}
+		c.nextID = commandID
+	}
+	conn := c.conn
+	finish, err := bindContext(ctx, conn)
+	if err != nil {
+		_ = c.discard()
+		return "", err
+	}
+	defer func() {
+		finish()
+		if err != nil || ctx.Err() != nil || command == "stop" {
+			_ = c.discard()
+		} else if err := conn.SetDeadline(time.Time{}); err != nil {
+			// The response is already complete, but this socket is no longer
+			// safe to reuse. Do not turn success into a command replay.
+			_ = c.discard()
+		}
+	}()
+	if fresh {
+		if err := c.authenticate(conn); err != nil {
+			return "", err
+		}
+	}
+	id := c.nextID
+	c.nextID += 2
+	return c.request(conn, command, id, id+1)
 }
 
 // exchange keeps protocol sequencing separate from connection/deadline setup.
 func (c *Client) exchange(conn io.ReadWriter, command string) (string, error) {
+	if err := c.authenticate(conn); err != nil {
+		return "", err
+	}
+	return c.request(conn, command, commandID, boundaryID)
+}
+
+func (c *Client) authenticate(conn io.ReadWriter) error {
 	if err := writePacket(conn, authID, 3, c.password); err != nil {
-		return "", fmt.Errorf("RCON authentication write: %w", err)
+		return fmt.Errorf("RCON authentication write: %w", err)
 	}
 	authenticated := false
 	for i := 0; i < 4; i++ {
 		p, err := readPacket(conn)
 		if err != nil {
-			return "", fmt.Errorf("RCON authentication response: %w", err)
+			return fmt.Errorf("RCON authentication response: %w", err)
 		}
 		if p.id == -1 {
-			return "", ErrAuthentication
+			return ErrAuthentication
 		}
 		if p.id != authID {
-			return "", errors.New("RCON authentication response ID mismatch")
+			return errors.New("RCON authentication response ID mismatch")
 		}
 		if p.kind == 2 {
 			authenticated = true
 			break
 		}
 		if p.kind != 0 || len(p.body) != 0 {
-			return "", errors.New("invalid RCON authentication response")
+			return errors.New("invalid RCON authentication response")
 		}
 	}
 	if !authenticated {
-		return "", errors.New("RCON authentication response limit exceeded")
+		return errors.New("RCON authentication response limit exceeded")
 	}
-	if err := writePacket(conn, commandID, 2, command); err != nil {
+	return nil
+}
+
+func (c *Client) request(conn io.ReadWriter, command string, requestID, endID int32) (string, error) {
+	if err := writePacket(conn, requestID, 2, command); err != nil {
 		return "", fmt.Errorf("RCON command write: %w", err)
 	}
 	var response strings.Builder
@@ -170,13 +297,13 @@ func (c *Client) exchange(conn io.ReadWriter, command string) (string, error) {
 		if p.kind != 0 {
 			return "", errors.New("invalid RCON command response type")
 		}
-		if p.id == boundaryID {
+		if p.id == endID {
 			if !seen {
 				return "", errors.New("RCON command response missing")
 			}
 			return response.String(), nil
 		}
-		if p.id != commandID {
+		if p.id != requestID {
 			return "", errors.New("RCON command response ID mismatch")
 		}
 		if len(p.body) > maxResponse-response.Len() {
@@ -187,7 +314,7 @@ func (c *Client) exchange(conn io.ReadWriter, command string) (string, error) {
 		if !boundarySent {
 			// Wait for a command response before sending another request so
 			// the two frames cannot coalesce in Minecraft's socket read.
-			if err := writePacket(conn, boundaryID, 0, ""); err != nil {
+			if err := writePacket(conn, endID, 0, ""); err != nil {
 				if command == "stop" && isStopReply(response.String()) {
 					return response.String(), nil
 				}
