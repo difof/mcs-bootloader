@@ -1,0 +1,67 @@
+version: '3'
+
+vars:
+  VERSION: '{{default "dev" .VERSION}}'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+  fmt:
+    desc: Format Go source
+    cmds:
+      - gofmt -w cmd internal
+  fmt:check:
+    desc: Check formatting without changing files
+    cmds:
+      - 'test -z "$(gofmt -l cmd internal)"'
+  vet:
+    desc: Run Go static analysis
+    cmds:
+      - go vet ./...
+  test:
+    desc: Run protocol, transport, and lifecycle race tests
+    cmds:
+      - go test -race -count=1 -timeout=90s ./...
+  check:
+    desc: Check formatting, static analysis, and race tests
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: test
+      - python3 -m unittest discover -s scripts -p 'test_*.py'
+  build:
+    desc: Build the daemon and local admin client
+    cmds:
+      - mkdir -p bin
+      - go build -trimpath -ldflags '-s -w -X main.version={{.VERSION}}' -o bin/mc-gateway ./cmd/mc-gateway
+  fuzz:handshake:
+    desc: Fuzz handshake framing for 10 seconds
+    cmds:
+      - go test ./internal/mcproto -run '^$' -fuzz '^FuzzReadHandshake$' -fuzztime=10s -parallel=2
+  install:
+    desc: Install using a private plan after verifying the stopped server and backup
+    cmds:
+      - task: check
+      - task: build
+      - sudo -n python3 scripts/install.py --plan .local/install.json --report .local/installation.json
+  status:
+    desc: Inspect the deployed gateway
+    cmds:
+      - sudo -n /opt/mc-gateway/bin/mc-gateway status
+  logs:
+    desc: Show recent gateway state and connection events
+    cmds:
+      - sudo -n journalctl --namespace=mc-gateway -u mc-gateway.service -n 100 --no-pager -o cat
+  logs:follow:
+    desc: Follow gateway events
+    cmds:
+      - sudo -n journalctl --namespace=mc-gateway -u mc-gateway.service -f -o cat
+  wake:
+    desc: Request one backend startup
+    cmds:
+      - sudo -n /opt/mc-gateway/bin/mc-gateway wake
+  sleep:
+    desc: Gracefully stop only if player checks confirm empty and no joins are active
+    cmds:
+      - sudo -n /opt/mc-gateway/bin/mc-gateway sleep
