@@ -85,5 +85,4 @@ jobs:
             "dist/$RELEASE_TAG/build-info.json" \
             --verify-tag --fail-on-no-commits \
             --title "mcs-bootloader $RELEASE_TAG" \
-            --notes-file "dist/$RELEASE_TAG/RELEASE_NOTES.md" \
-            --generate-notes
+            --notes-file "dist/$RELEASE_TAG/RELEASE_NOTES.md"
