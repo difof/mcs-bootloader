@@ -53,6 +53,7 @@ type runtimeTestBackend struct {
 	commands        []runtimeCommandCall
 	reply           string
 	commandErr      error
+	commandHook     func(context.Context, string, time.Duration) (string, error)
 }
 
 func (b *runtimeTestBackend) Start(ctx context.Context) error {
@@ -115,9 +116,13 @@ func (b *runtimeTestBackend) Command(ctx context.Context, command string, timeou
 		return "", err
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.commands = append(b.commands, runtimeCommandCall{command, timeout, b.password})
-	return b.reply, b.commandErr
+	hook, reply, err := b.commandHook, b.reply, b.commandErr
+	b.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, command, timeout)
+	}
+	return reply, err
 }
 
 type runtimeLogBuffer struct {
@@ -138,11 +143,13 @@ func (b *runtimeLogBuffer) String() string {
 }
 
 type runtimeFixture struct {
-	m      *runtimeConfig
-	b      *runtimeTestBackend
-	values map[string]string
-	log    *runtimeLogBuffer
-	socket string
+	m               *runtimeConfig
+	b               *runtimeTestBackend
+	values          map[string]string
+	log             *runtimeLogBuffer
+	socket          string
+	cancelLifecycle context.CancelFunc
+	lifecycleDone   chan struct{}
 }
 
 func newRuntimeFixture(t *testing.T, running bool) *runtimeFixture {
@@ -161,11 +168,15 @@ func newRuntimeFixture(t *testing.T, running bool) *runtimeFixture {
 			"MC_POLL_INTERVAL":     "1h",
 			"MC_OPERATION_TIMEOUT": "250ms",
 			"MC_ADMIN_SOCKET":      filepath.Join(dir, "control.sock"),
+			"MC_SERVER_DIRECTORY":  dir,
 		},
 		log:    &runtimeLogBuffer{},
 		socket: filepath.Join(dir, "control.sock"),
 	}
 	f.m = &runtimeConfig{path: filepath.Join(dir, ".env")}
+	if err := os.WriteFile(filepath.Join(dir, "server.properties"), []byte("white-list=false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	f.write(t, nil)
 	cfg, digest, err := readConfigSnapshot(f.m.path)
 	if err != nil {
@@ -179,6 +190,7 @@ func newRuntimeFixture(t *testing.T, running bool) *runtimeFixture {
 	f.m = &runtimeConfig{cfg: cfg.Clone(), path: f.m.path, digest: digest, generation: 1, controller: c, gateway: s, backend: f.b, level: level, log: logger}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	f.cancelLifecycle, f.lifecycleDone = cancel, done
 	go func() { c.Run(ctx); close(done) }()
 	t.Cleanup(func() {
 		cancel()

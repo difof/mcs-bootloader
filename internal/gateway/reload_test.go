@@ -165,6 +165,7 @@ func TestReconfigureRejectsInvalidOrStartupOnlyChanges(t *testing.T) {
 	changes := []func(*Config){
 		func(c *Config) { c.BackendAddress = "127.0.0.1:25567" },
 		func(c *Config) { c.Protocol++ },
+		func(c *Config) { c.ServerDirectory = "/another/server" },
 		func(c *Config) { c.BackendAddress = "invalid" },
 		func(c *Config) { c.BackendAddress = "127.0.0.1:0" },
 		func(c *Config) { c.MaxConnections = 0 },
@@ -172,6 +173,7 @@ func TestReconfigureRejectsInvalidOrStartupOnlyChanges(t *testing.T) {
 		func(c *Config) { c.HandshakeTimeout = 0 },
 		func(c *Config) { c.DialTimeout = -time.Second },
 		func(c *Config) { c.BootMessage = "" },
+		func(c *Config) { c.RestartMessage = "first\nsecond" },
 		func(c *Config) { c.FallbackStatus = json.RawMessage(`[]`) },
 		func(c *Config) { c.FallbackStatus = json.RawMessage(`null`) },
 		func(c *Config) { c.FallbackStatus = json.RawMessage(`{`) },

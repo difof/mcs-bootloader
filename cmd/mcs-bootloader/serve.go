@@ -20,9 +20,19 @@ import (
 	"github.com/difof/mcs-bootloader/internal/control"
 	"github.com/difof/mcs-bootloader/internal/gateway"
 	"github.com/difof/mcs-bootloader/internal/rcon"
+	"github.com/difof/mcs-bootloader/internal/telemetry"
 )
 
 func serve(configPath string) error {
+	configPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+	// Keep the actual startup source stable across aliases and atomic edits.
+	configPath, err = filepath.EvalSymlinks(configPath)
+	if err != nil {
+		return err
+	}
 	cfg, digest, err := readConfigSnapshot(configPath)
 	if err != nil {
 		return err
@@ -43,8 +53,14 @@ func serve(configPath string) error {
 		return fmt.Errorf("another gateway owns this state directory: %w", err)
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	// Signal notification must not cancel relays before Minecraft has delivered
+	// its native disconnect. The controller has a separate cancellation path.
+	ctx, cancelTraffic := context.WithCancel(context.Background())
+	defer cancelTraffic()
+	lifecycleCtx, cancelLifecycle := context.WithCancel(ctx)
+	defer cancelLifecycle()
 	rc := rcon.NewPersistent(cfg.RCONAddress, password, time.Duration(cfg.OperationTimeout))
 	b := &backend.Systemd{Service: cfg.Service, Address: cfg.BackendAddress, Protocol: cfg.Protocol, RCON: rc}
 	defer b.Close()
@@ -97,30 +113,89 @@ func serve(configPath string) error {
 	if err := os.Chmod(cfg.AdminSocket, 0600); err != nil {
 		return err
 	}
-	httpServer := &http.Server{Handler: adminHandler(c, s, runtime), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: maxCommandTimeout + 10*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096}
+	httpServer := &http.Server{Handler: adminHandler(c, s, runtime), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: maxCommandTimeout + 10*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096,
+		BaseContext: func(net.Listener) context.Context { return ctx }}
+	runtime.metrics = telemetry.New(telemetry.Source{
+		Snapshot: func() telemetry.Snapshot {
+			applied, metadata := runtime.snapshot()
+			return telemetry.Snapshot{Lifecycle: c.Snapshot(), Traffic: s.Stats(), IdleTimeout: time.Duration(applied.IdleTimeout), ConfigGeneration: metadata.Generation}
+		}, Command: b.Command, PID: b.MainPID, RCONStats: b.RCONStats, Status: c.CachedStatus,
+	}, version, log)
+	defer runtime.metrics.Close()
+	prepared, err := runtime.metrics.Prepare(metricsConfig(cfg))
+	if err != nil {
+		return fmt.Errorf("metrics startup: %w", err)
+	}
+	prepared.Commit()
 	errCh := make(chan error, 2)
-	go c.Run(ctx)
+	lifecycleDone := make(chan struct{})
+	go func() { defer close(lifecycleDone); c.Run(lifecycleCtx) }()
 	go func() { errCh <- s.Serve(ctx, listener) }()
 	go func() { errCh <- httpServer.Serve(admin) }()
 	cacheDone := make(chan struct{})
 	go func() { defer close(cacheDone); persistCache(ctx, c, cachePath, log) }()
 	log.Info("gateway_started", "version", version, "listen", cfg.Listen, "backend", cfg.BackendAddress, "idle_timeout", time.Duration(cfg.IdleTimeout).String(), "admin_socket", cfg.AdminSocket)
 	select {
-	case <-ctx.Done():
+	case <-signalCtx.Done():
+		runtime.drainForShutdown(cancelLifecycle, lifecycleDone)
 	case err = <-errCh:
 		if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
-		cancel()
+		// Startup/component failure is not an operator restart. It must never
+		// kick unrelated players simply because this gateway failed to run.
+		runtime.shuttingDown.Store(true)
+		cancelLifecycle()
 	}
+	cancelTraffic()
 	listener.Close()
 	s.Close()
-	shutdownCtx, done := context.WithTimeout(context.Background(), 3*time.Second)
+	applied, _ := runtime.snapshot()
+	shutdownCtx, done := context.WithTimeout(context.Background(), time.Duration(applied.OperationTimeout))
 	defer done()
 	httpServer.Shutdown(shutdownCtx)
 	<-cacheDone
 	log.Info("gateway_stopped", "backend_action", "left_under_separate_supervisor")
 	return err
+}
+
+// drainForShutdown preserves the established byte streams until the backend
+// itself sends each player's disconnect. It never stops or starts Minecraft.
+// Abrupt process death cannot deliver a message; controlled SIGTERM/SIGINT can.
+func (m *runtimeConfig) drainForShutdown(cancelLifecycle context.CancelFunc, lifecycleDone <-chan struct{}) {
+	m.shuttingDown.Store(true)
+	active := m.gateway.BeginDrain()
+	cancelLifecycle()
+	cfg, _ := m.snapshot()
+	workerCtx, workerCancel := context.WithTimeout(context.Background(), time.Duration(cfg.OperationTimeout))
+	workerStopped := false
+	select {
+	case <-lifecycleDone:
+		workerStopped = true
+	case <-workerCtx.Done():
+	}
+	workerCancel()
+	if m.metrics != nil {
+		_ = m.metrics.Close()
+	}
+	snapshot := m.controller.Snapshot()
+	playersPresent := snapshot.Players != nil && *snapshot.Players > 0
+	messageSent := false
+	if workerStopped && snapshot.State != control.Stopping && (active > 0 || playersPresent) {
+		commandCtx, commandCancel := context.WithTimeout(context.Background(), time.Duration(cfg.OperationTimeout))
+		_, err := m.backend.Command(commandCtx, "kick @a "+cfg.RestartMessage, time.Duration(cfg.OperationTimeout))
+		commandCancel()
+		if err != nil {
+			// Do not expose arbitrary RCON text or config values in the journal.
+			m.log.Warn("gateway_restart_notice_failed", "error", "Minecraft did not acknowledge the native disconnect before the operation timeout")
+		} else {
+			messageSent = true
+		}
+	}
+	graceCtx, graceCancel := context.WithTimeout(context.Background(), time.Duration(cfg.RestartGrace))
+	drained := m.gateway.WaitForRelays(graceCtx) == nil
+	graceCancel()
+	m.log.Info("gateway_drained", "active_relays_at_start", active, "native_disconnect_sent", messageSent, "relays_drained", drained, "lifecycle_stopped", workerStopped)
 }
 
 func readCache(path string) (json.RawMessage, error) {

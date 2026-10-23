@@ -38,9 +38,9 @@ func (s *Server) statusWithConfig(cfg Config) json.RawMessage {
 		case control.Starting:
 			message = cfg.StartingMOTD
 		case control.Stopping:
-			message = "Server is saving and going to sleep. Please reconnect shortly."
+			message = cfg.StoppingMOTD
 		case control.Unknown:
-			message = "Checking server health. Please reconnect shortly."
+			message = cfg.UnknownMOTD
 		}
 		status["description"], _ = json.Marshal(map[string]string{"text": message})
 		count := 0
@@ -48,6 +48,9 @@ func (s *Server) statusWithConfig(cfg Config) json.RawMessage {
 			count = *snapshot.Players
 		}
 		setPlayerCount(status, count, true)
+	}
+	if cfg.OverrideMOTD {
+		status["description"], _ = json.Marshal(map[string]string{"text": cfg.MOTD})
 	}
 	encoded, _ := json.Marshal(status)
 	return encoded

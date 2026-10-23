@@ -42,30 +42,42 @@ type Config struct {
 	RCONAddress      string `json:"rcon_address"`
 	RCONPasswordFile string `json:"rcon_password_file"`
 	// RCONPassword lives only in the private .env, never a JSON response or log.
-	RCONPassword      string   `json:"-"`
-	Service           string   `json:"backend_service"`
-	StateDirectory    string   `json:"state_directory"`
-	AdminSocket       string   `json:"admin_socket"`
-	ServerDirectory   string   `json:"server_directory"`
-	LaunchExecutable  string   `json:"launch_executable"`
-	LaunchArgs        []string `json:"launch_args"`
-	Protocol          int      `json:"protocol"`
-	Version           string   `json:"version"`
-	MaxPlayers        int      `json:"max_players"`
-	MaxConnections    int      `json:"max_connections"`
-	IdleTimeout       Duration `json:"idle_timeout"`
-	PollInterval      Duration `json:"poll_interval"`
-	OperationTimeout  Duration `json:"operation_timeout"`
-	StartupTimeout    Duration `json:"startup_timeout"`
-	ShutdownWarnAfter Duration `json:"shutdown_warn_after"`
-	WakeCooldown      Duration `json:"wake_cooldown"`
-	HandshakeTimeout  Duration `json:"handshake_timeout"`
-	DialTimeout       Duration `json:"dial_timeout"`
-	BootMessage       string   `json:"boot_message"`
-	SleepingMOTD      string   `json:"sleeping_motd"`
-	StartingMOTD      string   `json:"starting_motd"`
-	FailedMOTD        string   `json:"failed_motd"`
-	LogLevel          string   `json:"log_level"`
+	RCONPassword          string   `json:"-"`
+	Service               string   `json:"backend_service"`
+	StateDirectory        string   `json:"state_directory"`
+	AdminSocket           string   `json:"admin_socket"`
+	ServerDirectory       string   `json:"server_directory"`
+	LaunchExecutable      string   `json:"launch_executable"`
+	LaunchArgs            []string `json:"launch_args"`
+	Protocol              int      `json:"protocol"`
+	Version               string   `json:"version"`
+	MaxPlayers            int      `json:"max_players"`
+	MaxConnections        int      `json:"max_connections"`
+	IdleTimeout           Duration `json:"idle_timeout"`
+	PollInterval          Duration `json:"poll_interval"`
+	OperationTimeout      Duration `json:"operation_timeout"`
+	StartupTimeout        Duration `json:"startup_timeout"`
+	ShutdownWarnAfter     Duration `json:"shutdown_warn_after"`
+	WakeCooldown          Duration `json:"wake_cooldown"`
+	HandshakeTimeout      Duration `json:"handshake_timeout"`
+	DialTimeout           Duration `json:"dial_timeout"`
+	RestartGrace          Duration `json:"restart_grace"`
+	BootMessage           string   `json:"boot_message"`
+	SleepingMOTD          string   `json:"sleeping_motd"`
+	StartingMOTD          string   `json:"starting_motd"`
+	StoppingMOTD          string   `json:"stopping_motd"`
+	UnknownMOTD           string   `json:"unknown_motd"`
+	FailedMOTD            string   `json:"failed_motd"`
+	OverrideMOTD          bool     `json:"override_motd"`
+	MOTD                  string   `json:"motd"`
+	RestartMessage        string   `json:"restart_message"`
+	WhitelistMessage      string   `json:"whitelist_message"`
+	MetricsEnabled        bool     `json:"metrics_enabled"`
+	MetricsListen         string   `json:"metrics_listen"`
+	MetricsPollInterval   Duration `json:"metrics_poll_interval"`
+	MetricsPlayerInterval Duration `json:"metrics_player_interval"`
+	MetricsPlayerDetails  bool     `json:"metrics_player_details"`
+	LogLevel              string   `json:"log_level"`
 }
 
 func DefaultConfig() Config {
@@ -77,10 +89,14 @@ func DefaultConfig() Config {
 		Protocol: 767, Version: "1.21.1", MaxPlayers: 5, MaxConnections: 64,
 		IdleTimeout: Duration(time.Hour), PollInterval: Duration(15 * time.Second), OperationTimeout: Duration(5 * time.Second),
 		StartupTimeout: Duration(15 * time.Minute), ShutdownWarnAfter: Duration(3 * time.Minute), WakeCooldown: Duration(30 * time.Second),
-		HandshakeTimeout: Duration(5 * time.Second), DialTimeout: Duration(3 * time.Second),
+		HandshakeTimeout: Duration(5 * time.Second), DialTimeout: Duration(3 * time.Second), RestartGrace: Duration(3 * time.Second),
 		BootMessage:  "Server is booting up. Please reconnect in a few minutes.",
 		SleepingMOTD: "Server is sleeping. Join to start it.", StartingMOTD: "Server is booting up. Please wait...",
+		StoppingMOTD: "Server is saving and going to sleep. Please reconnect shortly.", UnknownMOTD: "Checking server health. Please reconnect shortly.",
 		FailedMOTD: "Server is unavailable. Please try again shortly.", LogLevel: "info",
+		MOTD: "Minecraft server", RestartMessage: "Gateway is restarting. Please reconnect in a moment.",
+		WhitelistMessage: "You are not whitelisted on this server.",
+		MetricsListen:    "127.0.0.1:9464", MetricsPollInterval: Duration(15 * time.Second), MetricsPlayerInterval: Duration(time.Minute), MetricsPlayerDetails: true,
 	}
 }
 
@@ -179,7 +195,18 @@ func (c Config) Validate() error {
 	if c.MaxConnections < 1 || c.MaxConnections > 4096 || c.MaxPlayers < 1 {
 		return fmt.Errorf("invalid connection/player limit")
 	}
-	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "poll_interval": c.PollInterval, "operation_timeout": c.OperationTimeout, "startup_timeout": c.StartupTimeout, "shutdown_warn_after": c.ShutdownWarnAfter, "wake_cooldown": c.WakeCooldown, "handshake_timeout": c.HandshakeTimeout, "dial_timeout": c.DialTimeout} {
+	metricsHost, metricsPort, metricsErr := net.SplitHostPort(c.MetricsListen)
+	if metricsErr != nil || metricsHost == "" || !validPort(metricsPort) {
+		return fmt.Errorf("metrics_listen must contain a numeric IP address and valid port")
+	}
+	if _, err := netip.ParseAddr(metricsHost); err != nil {
+		return fmt.Errorf("metrics_listen must contain a numeric IP address")
+	}
+	metricsNumber, _ := strconv.Atoi(metricsPort)
+	if c.MetricsEnabled && ports[metricsNumber] {
+		return fmt.Errorf("enabled metrics must use a different port from the gateway, backend and RCON")
+	}
+	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "poll_interval": c.PollInterval, "operation_timeout": c.OperationTimeout, "startup_timeout": c.StartupTimeout, "shutdown_warn_after": c.ShutdownWarnAfter, "wake_cooldown": c.WakeCooldown, "handshake_timeout": c.HandshakeTimeout, "dial_timeout": c.DialTimeout, "restart_grace": c.RestartGrace, "metrics_poll_interval": c.MetricsPollInterval, "metrics_player_interval": c.MetricsPlayerInterval} {
 		if d <= 0 {
 			return fmt.Errorf("%s must be positive", name)
 		}
@@ -190,10 +217,13 @@ func (c Config) Validate() error {
 	if c.LogLevel != "info" && c.LogLevel != "debug" && c.LogLevel != "warn" {
 		return fmt.Errorf("log_level must be info, warn, or debug")
 	}
-	for _, message := range []string{c.BootMessage, c.SleepingMOTD, c.StartingMOTD, c.FailedMOTD} {
-		if len(message) == 0 || len(message) > 4096 {
+	for _, message := range []string{c.BootMessage, c.SleepingMOTD, c.StartingMOTD, c.StoppingMOTD, c.UnknownMOTD, c.FailedMOTD, c.MOTD, c.RestartMessage, c.WhitelistMessage} {
+		if len(message) == 0 || len(message) > 4096 || !utf8.ValidString(message) || strings.ContainsAny(message, "\x00\r") {
 			return fmt.Errorf("messages must contain 1-4096 bytes")
 		}
+	}
+	if strings.Contains(c.RestartMessage, "\n") {
+		return fmt.Errorf("restart_message must be a single line")
 	}
 	return nil
 }

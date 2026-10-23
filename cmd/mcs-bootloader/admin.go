@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/difof/mcs-bootloader/internal/backend"
@@ -25,6 +27,7 @@ const maxCommandTimeout = 5 * time.Minute
 // (for example '<' becomes '\u003c'). Include that expansion and defaults
 // while keeping both configuration response readers explicitly bounded.
 const maxConfigResponseBytes = 512 * 1024
+const maxMetricsResponseBytes = 8 * 1024 * 1024
 
 type commandRequest struct {
 	Command string `json:"command"`
@@ -35,6 +38,7 @@ type commandResponse struct {
 }
 type reloadRequest struct {
 	ExpectedSHA256 string `json:"expected_sha256"`
+	EnvPath        string `json:"env_path,omitempty"`
 }
 
 // This envelope is used only by backend-start/backend-stop on the same private
@@ -68,6 +72,18 @@ func adminHandler(c *control.Controller, s *gateway.Server, m *runtimeConfig) ht
 	mux.HandleFunc("GET /v1/config", func(w http.ResponseWriter, r *http.Request) {
 		cfg, metadata := m.snapshot()
 		jsonReply(w, map[string]any{"configuration": metadata, "effective": cfg, "rcon_password": "[REDACTED]"})
+	})
+	mux.HandleFunc("GET /v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+		cfg, _ := m.snapshot()
+		if !cfg.MetricsEnabled || m.metrics == nil {
+			http.Error(w, "metrics are disabled; set MC_METRICS_ENABLED=true in .env and run task config:reload", http.StatusServiceUnavailable)
+			return
+		}
+		// The same cache serves both endpoints; this route needs neither a
+		// public listener address lookup nor any additional RCON exchange.
+		forward := r.Clone(r.Context())
+		forward.URL.Path = "/metrics"
+		m.metrics.Handler().ServeHTTP(w, forward)
 	})
 	mux.HandleFunc("GET /v1/backend", func(w http.ResponseWriter, r *http.Request) {
 		cfg, _ := m.snapshot()
@@ -103,7 +119,7 @@ func adminHandler(c *control.Controller, s *gateway.Server, m *runtimeConfig) ht
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		result, err := m.reload(ctx, request.ExpectedSHA256)
+		result, err := m.reload(ctx, request.ExpectedSHA256, request.EnvPath)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
@@ -152,7 +168,13 @@ func adminHandler(c *control.Controller, s *gateway.Server, m *runtimeConfig) ht
 		}
 		jsonReply(w, commandResponse{Reply: reply})
 	})
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && m.shuttingDown.Load() {
+			http.Error(w, "gateway is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // Each operation gets a fresh transport and is submitted once. In particular,
@@ -200,6 +222,8 @@ func adminClient(command string, args []string) error {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	socket := flags.String("socket", "/run/mcs-bootloader/control.sock", "admin Unix socket")
 	configPath := flags.String("config", defaultConfigPath, "configuration file to apply")
+	envPath := flags.String("env", "", "explicit .env source to reload (same file as the running daemon)")
+	expected := flags.String("expected-sha256", "", "optional SHA-256 of the caller's validated .env snapshot")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -207,22 +231,43 @@ func adminClient(command string, args []string) error {
 		return errors.New("unexpected arguments")
 	}
 	method := "GET"
-	if command != "status" && command != "config" {
+	if command != "status" && command != "config" && command != "metrics" {
 		method = "POST"
 	}
 	var body any
 	if command == "reload" || command == "restart-check" {
+		requestPath := ""
+		if *envPath != "" {
+			var err error
+			requestPath, err = filepath.Abs(*envPath)
+			if err != nil {
+				return err
+			}
+			*configPath = requestPath
+		}
 		_, digest, err := readConfigSnapshot(*configPath)
 		if err != nil {
 			return err
 		}
-		body = reloadRequest{ExpectedSHA256: digest}
+		if *expected != "" {
+			decoded, err := hex.DecodeString(*expected)
+			if err != nil || len(decoded) != 32 {
+				return errors.New("expected-sha256 must contain 64 hexadecimal characters")
+			}
+			if *expected != digest {
+				return errors.New(".env changed after validation; prepare the request again")
+			}
+		}
+		body = reloadRequest{ExpectedSHA256: digest, EnvPath: requestPath}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	limit := int64(65536)
 	if command == "config" {
 		limit = maxConfigResponseBytes
+	}
+	if command == "metrics" {
+		limit = maxMetricsResponseBytes
 	}
 	data, err := socketRequest(ctx, *socket, method, command, body, limit)
 	if err != nil {

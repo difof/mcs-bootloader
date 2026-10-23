@@ -75,6 +75,44 @@ MC_BACKUP_DIRECTORY=/srv/minecraft-backups/pre-gateway
 	}
 }
 
+func TestLiveDisplayMetricsAndRestartEnvironment(t *testing.T) {
+	cfg, err := LoadEnv(envWith(`MC_OVERRIDE_MOTD=TrUe
+MC_MOTD="Friends\nHeavy modpack"
+MC_RESTART_MESSAGE="Gateway update in progress; reconnect shortly"
+MC_RESTART_GRACE=8s
+MC_WHITELIST_MESSAGE="Friends only\nAsk the owner"
+MC_STOPPING_MOTD="Saving the world"
+MC_UNKNOWN_MOTD="Checking Minecraft"
+MC_METRICS_ENABLED=TRUE
+MC_METRICS_LISTEN=127.0.0.1:9465
+MC_METRICS_POLL_INTERVAL=30s
+MC_METRICS_PLAYER_INTERVAL=2m
+MC_METRICS_PLAYER_DETAILS=FALSE
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OverrideMOTD || cfg.MOTD != "Friends\nHeavy modpack" || cfg.RestartGrace != Duration(8*time.Second) || cfg.WhitelistMessage != "Friends only\nAsk the owner" || cfg.StoppingMOTD != "Saving the world" || cfg.UnknownMOTD != "Checking Minecraft" {
+		t.Fatal("live display configuration did not parse exactly")
+	}
+	if !cfg.MetricsEnabled || cfg.MetricsListen != "127.0.0.1:9465" || cfg.MetricsPollInterval != Duration(30*time.Second) || cfg.MetricsPlayerInterval != Duration(2*time.Minute) || cfg.MetricsPlayerDetails {
+		t.Fatal("typed metrics configuration did not parse exactly")
+	}
+	for _, body := range []string{
+		"MC_OVERRIDE_MOTD=1", "MC_OVERRIDE_MOTD=yes", "MC_METRICS_ENABLED=on", "MC_METRICS_PLAYER_DETAILS=0",
+		`MC_RESTART_MESSAGE="first\nsecond"`, `MC_RESTART_MESSAGE="first\rsecond"`, `MC_RESTART_MESSAGE="first\u0000second"`,
+		"MC_RESTART_MESSAGE=" + strings.Repeat("x", 4097), "MC_MOTD=" + strings.Repeat("界", 1366),
+		"MC_RESTART_GRACE=0s", "MC_METRICS_POLL_INTERVAL=0s", "MC_METRICS_PLAYER_INTERVAL=0s", "MC_METRICS_LISTEN=localhost:9464", "MC_METRICS_LISTEN=127.0.0.1:0",
+		"MC_METRICS_ENABLED=true\nMC_METRICS_LISTEN=127.0.0.1:25575",
+		"MC_METRICS_ENABLED=true\nMC_METRICS_LISTEN=127.0.0.1:25566",
+		"MC_METRICS_ENABLED=true\nMC_METRICS_LISTEN=0.0.0.0:25565",
+	} {
+		if _, err := LoadEnv(envWith(body)); err == nil {
+			t.Fatalf("invalid display/metrics configuration accepted: %s", strings.Split(body, "=")[0])
+		}
+	}
+}
+
 func TestLoadEnvRejectsInvalidInputWithoutValues(t *testing.T) {
 	secret := "DO_NOT_ECHO_CONFIG_VALUE_12345"
 	cases := map[string][]byte{

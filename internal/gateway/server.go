@@ -10,13 +10,17 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/difof/mcs-bootloader/internal/control"
 	"github.com/difof/mcs-bootloader/internal/mcproto"
+	"github.com/difof/mcs-bootloader/internal/whitelist"
 )
 
 type Controller interface {
@@ -28,6 +32,7 @@ type Controller interface {
 
 type Config struct {
 	BackendAddress   string
+	ServerDirectory  string
 	Protocol         int
 	MaxConnections   int
 	HandshakeTimeout time.Duration
@@ -35,7 +40,13 @@ type Config struct {
 	BootMessage      string
 	SleepingMOTD     string
 	StartingMOTD     string
+	StoppingMOTD     string
+	UnknownMOTD      string
 	FailedMOTD       string
+	OverrideMOTD     bool
+	MOTD             string
+	RestartMessage   string
+	WhitelistMessage string
 	FallbackStatus   json.RawMessage
 }
 
@@ -53,16 +64,22 @@ func (cfg Config) Validate() error {
 	if cfg.Protocol <= 0 {
 		return errors.New("protocol must be positive")
 	}
+	if !filepath.IsAbs(cfg.ServerDirectory) || filepath.Clean(cfg.ServerDirectory) == "/" || strings.ContainsAny(cfg.ServerDirectory, "\x00\r\n") {
+		return errors.New("server directory must be an absolute, non-root path")
+	}
 	if cfg.MaxConnections < 1 || cfg.MaxConnections > 4096 {
 		return errors.New("maximum connections must be between 1 and 4096")
 	}
 	if cfg.HandshakeTimeout <= 0 || cfg.DialTimeout <= 0 {
 		return errors.New("handshake and dial timeouts must be positive")
 	}
-	for _, message := range []string{cfg.BootMessage, cfg.SleepingMOTD, cfg.StartingMOTD, cfg.FailedMOTD} {
-		if len(message) == 0 || len(message) > 4096 {
+	for _, message := range []string{cfg.BootMessage, cfg.SleepingMOTD, cfg.StartingMOTD, cfg.StoppingMOTD, cfg.UnknownMOTD, cfg.FailedMOTD, cfg.MOTD, cfg.RestartMessage, cfg.WhitelistMessage} {
+		if len(message) == 0 || len(message) > 4096 || !utf8.ValidString(message) || strings.ContainsAny(message, "\x00\r") {
 			return errors.New("messages must contain 1-4096 bytes")
 		}
+	}
+	if strings.Contains(cfg.RestartMessage, "\n") {
+		return errors.New("restart message must be a single line")
 	}
 	if len(cfg.FallbackStatus) > 0 {
 		var obj map[string]json.RawMessage
@@ -85,11 +102,18 @@ type Stats struct {
 	WakeLimited      uint64 `json:"wake_limited"`
 	Routed           uint64 `json:"routed"`
 	BackendErrors    uint64 `json:"backend_errors"`
+	WhitelistDenied  uint64 `json:"whitelist_denied"`
+	WhitelistErrors  uint64 `json:"whitelist_errors"`
+	DrainingRejected uint64 `json:"draining_rejected"`
+	BytesToBackend   uint64 `json:"bytes_to_backend"`
+	BytesToClient    uint64 `json:"bytes_to_client"`
 }
 
 type counters struct {
 	accepted, capacityRejected, invalidRequests, statusRequests     atomic.Uint64
 	loginRequests, wakeRequests, wakeLimited, routed, backendErrors atomic.Uint64
+	whitelistDenied, whitelistErrors, drainingRejected              atomic.Uint64
+	bytesToBackend, bytesToClient                                   atomic.Uint64
 }
 
 type Server struct {
@@ -103,6 +127,11 @@ type Server struct {
 	connections               map[net.Conn]struct{}
 	cancel                    context.CancelFunc
 	closed                    bool
+	draining                  bool
+	activeRelays              int
+	relaysChanged             chan struct{}
+	admissions                context.Context
+	stopAdmissions            context.CancelFunc
 	wg                        sync.WaitGroup
 	errorMu                   sync.Mutex
 	lastBackendWarning        time.Time
@@ -110,6 +139,9 @@ type Server struct {
 }
 
 func New(cfg Config, controller Controller, logger *slog.Logger) *Server {
+	if cfg.ServerDirectory == "" {
+		cfg.ServerDirectory = "/srv/minecraft"
+	}
 	if cfg.Protocol == 0 {
 		cfg.Protocol = 767
 	}
@@ -134,10 +166,26 @@ func New(cfg Config, controller Controller, logger *slog.Logger) *Server {
 	if cfg.FailedMOTD == "" {
 		cfg.FailedMOTD = "Server is temporarily unavailable. Please try again shortly."
 	}
+	if cfg.StoppingMOTD == "" {
+		cfg.StoppingMOTD = "Server is saving and going to sleep. Please reconnect shortly."
+	}
+	if cfg.UnknownMOTD == "" {
+		cfg.UnknownMOTD = "Checking server health. Please reconnect shortly."
+	}
+	if cfg.MOTD == "" {
+		cfg.MOTD = "Minecraft server"
+	}
+	if cfg.RestartMessage == "" {
+		cfg.RestartMessage = "Gateway is restarting. Please reconnect in a moment."
+	}
+	if cfg.WhitelistMessage == "" {
+		cfg.WhitelistMessage = "You are not whitelisted on this server."
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{controller: controller, log: logger, connections: make(map[net.Conn]struct{})}
+	admissions, stopAdmissions := context.WithCancel(context.Background())
+	s := &Server{controller: controller, log: logger, connections: make(map[net.Conn]struct{}), relaysChanged: make(chan struct{}), admissions: admissions, stopAdmissions: stopAdmissions}
 	cfg.FallbackStatus = append(json.RawMessage(nil), cfg.FallbackStatus...)
 	s.cfg.Store(&cfg)
 	return s
@@ -162,8 +210,8 @@ func (s *Server) Reconfigure(cfg Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current := s.cfg.Load()
-	if cfg.BackendAddress != current.BackendAddress || cfg.Protocol != current.Protocol {
-		return errors.New("backend address and protocol cannot change at runtime")
+	if cfg.BackendAddress != current.BackendAddress || cfg.Protocol != current.Protocol || cfg.ServerDirectory != current.ServerDirectory {
+		return errors.New("backend address, protocol and server directory cannot change at runtime")
 	}
 	s.cfg.Store(&cfg)
 	return nil
@@ -175,7 +223,69 @@ func (s *Server) Stats() Stats {
 		InvalidRequests: s.stats.invalidRequests.Load(), StatusRequests: s.stats.statusRequests.Load(),
 		LoginRequests: s.stats.loginRequests.Load(), WakeRequests: s.stats.wakeRequests.Load(),
 		WakeLimited: s.stats.wakeLimited.Load(), Routed: s.stats.routed.Load(), BackendErrors: s.stats.backendErrors.Load(),
+		WhitelistDenied: s.stats.whitelistDenied.Load(), WhitelistErrors: s.stats.whitelistErrors.Load(), DrainingRejected: s.stats.drainingRejected.Load(),
+		BytesToBackend: s.stats.bytesToBackend.Load(), BytesToClient: s.stats.bytesToClient.Load(),
 	}
+}
+
+// BeginDrain closes login admission while leaving established relays intact.
+// Minecraft sends the actual disconnect through RCON so its own compression,
+// encryption and mod framing stay authoritative. Status pings remain available.
+func (s *Server) BeginDrain() int {
+	s.mu.Lock()
+	s.draining = true
+	active := s.activeRelays
+	s.mu.Unlock()
+	s.stopAdmissions()
+	return active
+}
+
+func (s *Server) isDraining() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.draining || s.closed
+}
+
+// WaitForRelays includes joins still dialing or completing their initial
+// forwarding; a stalled peer cannot extend the caller's configured grace.
+func (s *Server) WaitForRelays(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		active, changed := s.activeRelays, s.relaysChanged
+		s.mu.Unlock()
+		if active == 0 {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *Server) acquireJoin() (release func(), acquired, draining bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.draining || s.closed {
+		return nil, false, true
+	}
+	controllerRelease, acquired := s.controller.AcquireJoin()
+	if !acquired {
+		return nil, false, false
+	}
+	s.activeRelays++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			controllerRelease()
+			s.mu.Lock()
+			s.activeRelays--
+			close(s.relaysChanged)
+			s.relaysChanged = make(chan struct{})
+			s.mu.Unlock()
+		})
+	}, true, false
 }
 
 // Serve owns listener. Cancellation closes gateway connections but deliberately
@@ -253,6 +363,7 @@ func (s *Server) Close() error {
 		connections = append(connections, conn)
 	}
 	s.mu.Unlock()
+	s.stopAdmissions()
 	if cancel != nil {
 		cancel()
 	}
@@ -291,18 +402,42 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 		return
 	}
 	s.stats.loginRequests.Add(1)
-	release, acquired := s.controller.AcquireJoin()
+	if s.rejectDraining(conn, handshake.Protocol) {
+		return
+	}
+	allowed, whitelistErr := whitelist.Check(cfg.ServerDirectory, name)
+	if whitelistErr != nil || !allowed {
+		message := cfg.WhitelistMessage
+		if whitelistErr != nil {
+			s.stats.whitelistErrors.Add(1)
+			message = cfg.FailedMOTD
+		} else {
+			s.stats.whitelistDenied.Add(1)
+		}
+		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, message)
+		return
+	}
+	release, acquired, draining := s.acquireJoin()
+	if draining {
+		s.rejectDraining(conn, handshake.Protocol)
+		return
+	}
 	if !acquired {
 		before := s.controller.Snapshot()
 		if before.State != control.Ready && s.limiter.allow(clientHost(conn), time.Now()) {
 			s.stats.wakeRequests.Add(1)
 			wakeCtx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
+			stopCancel := context.AfterFunc(s.admissions, cancel)
 			_ = s.controller.Wake(wakeCtx)
+			stopCancel()
 			cancel()
 		} else if before.State != control.Ready {
 			s.stats.wakeLimited.Add(1)
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if s.rejectDraining(conn, handshake.Protocol) {
+			return
+		}
 		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, disconnectMessage(cfg, s.controller.Snapshot().State))
 		return
 	}
@@ -317,6 +452,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 		return
 	}
 	defer backend.Close()
+	if s.rejectDraining(conn, handshake.Protocol) {
+		return
+	}
 	setKeepAlive(backend)
 	stopClose := context.AfterFunc(ctx, func() { backend.Close(); conn.Close() })
 	defer stopClose()
@@ -329,6 +467,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 		s.logBackendError("backend_login_forward_failed", err)
 		return
 	}
+	s.stats.bytesToBackend.Add(uint64(len(handshake.Raw) + len(login)))
 	// No gameplay deadlines or parsing: large registries, mod payloads, login
 	// extensions, compression, and encryption remain the backend's responsibility.
 	_ = backend.SetDeadline(time.Time{})
@@ -336,7 +475,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 	s.stats.routed.Add(1)
 	started := time.Now()
 	s.log.Info("connection_opened", "client", clientHost(conn), "name_unverified", name)
-	toBackend, toClient, relayErr := relay(ctx, conn, backend)
+	toBackend, toClient, relayErr := relay(ctx, conn, backend, &s.stats)
 	args := []any{"client", clientHost(conn), "name_unverified", name, "duration", time.Since(started).Round(time.Millisecond).String(), "bytes_to_backend", toBackend + int64(len(handshake.Raw)+len(login)), "bytes_to_client", toClient}
 	if relayErr != nil {
 		args = append(args, "error", relayErr)
@@ -344,14 +483,23 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 	s.log.Info("connection_closed", args...)
 }
 
+func (s *Server) rejectDraining(conn net.Conn, protocol int) bool {
+	if !s.isDraining() {
+		return false
+	}
+	s.stats.drainingRejected.Add(1)
+	_ = mcproto.WriteDisconnect(conn, protocol, s.cfg.Load().RestartMessage)
+	return true
+}
+
 func disconnectMessage(cfg Config, state control.State) string {
 	switch state {
 	case control.Asleep, control.Starting:
 		return cfg.BootMessage
 	case control.Stopping:
-		return "Server is saving and shutting down. Please reconnect shortly."
+		return cfg.StoppingMOTD
 	case control.Unknown:
-		return "Server health is being checked. Please reconnect shortly."
+		return cfg.UnknownMOTD
 	default:
 		return cfg.FailedMOTD
 	}
@@ -411,10 +559,29 @@ type relayResult struct {
 	err       error
 }
 
-func relay(ctx context.Context, client, backend net.Conn) (toBackend, toClient int64, err error) {
+type trafficWriter struct {
+	writer io.Writer
+	bytes  *atomic.Uint64
+}
+
+func (w trafficWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	w.bytes.Add(uint64(n))
+	return n, err
+}
+
+func relay(ctx context.Context, client, backend net.Conn, stats ...*counters) (toBackend, toClient int64, err error) {
 	results := make(chan relayResult, 2)
 	copyDirection := func(direction int, dst, src net.Conn) {
-		n, copyErr := io.Copy(dst, src)
+		var writer io.Writer = dst
+		if len(stats) > 0 {
+			counter := &stats[0].bytesToBackend
+			if direction == 1 {
+				counter = &stats[0].bytesToClient
+			}
+			writer = trafficWriter{writer: dst, bytes: counter}
+		}
+		n, copyErr := io.Copy(writer, src)
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}

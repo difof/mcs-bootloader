@@ -197,7 +197,7 @@ class OperatorTests(unittest.TestCase):
 
     def test_start_stop_status_and_version_run_as_service_user(self):
         for action, operation in (("start", "wake"), ("stop", "sleep"),
-                                  ("status", "status"), ("config-live", "config"),
+                                  ("status", "status"), ("metrics", "metrics"), ("config-live", "config"),
                                   ("version", "version")):
             with self.subTest(action=action):
                 with self.assertRaises(ExecRequested) as launched:
@@ -228,7 +228,7 @@ class OperatorTests(unittest.TestCase):
         before = fingerprint(self.canonical)
         self.process.side_effect = None
         self.process.return_value = subprocess.CompletedProcess([], 0, stdout="valid\n", stderr="")
-        for action in ("config-check", "config-apply", "reload"):
+        for action in ("config-check", "config-reload", "config-apply", "reload"):
             with self.subTest(action=action), contextlib.redirect_stdout(io.StringIO()):
                 self.process.reset_mock()
                 manage.operate(action, [])
@@ -237,7 +237,8 @@ class OperatorTests(unittest.TestCase):
                     argv += ["check", "--config", str(self.canonical)]
                 else:
                     argv += ["reload", "--socket", self.values["MC_ADMIN_SOCKET"],
-                             "--config", str(self.canonical)]
+                             "--env", str(self.canonical), "--expected-sha256",
+                             hashlib.sha256(self.canonical.read_bytes()).hexdigest()]
                 self.process.assert_called_once_with(
                     argv, text=True, capture_output=action == "config-check", check=False,
                 )
@@ -245,6 +246,29 @@ class OperatorTests(unittest.TestCase):
                 self.assertEqual(fingerprint(self.canonical), before)
                 self.assertEqual(list(self.root.iterdir()), [self.env_file])
         self.execute.assert_not_called()
+
+    def test_reload_resolves_explicit_alias_and_hashes_exact_snapshot(self):
+        alias = self.root / "literal {{.UNCHANGED}} path.env"
+        alias.symlink_to(self.canonical)
+        self.process.side_effect = None
+        self.process.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        before = fingerprint(self.canonical)
+        with contextlib.redirect_stdout(io.StringIO()):
+            manage.operate("config-reload", [str(alias)])
+        argv = self.process.call_args.args[0]
+        self.assertEqual(argv[-4:], ["--env", str(self.canonical), "--expected-sha256",
+                                    hashlib.sha256(self.canonical.read_bytes()).hexdigest()])
+        self.assertEqual(fingerprint(self.canonical), before)
+        self.assertTrue(alias.is_symlink())
+
+    def test_reload_rejects_different_file_even_if_identical(self):
+        duplicate = self.root / "duplicate.env"
+        duplicate.write_bytes(self.canonical.read_bytes())
+        with self.assertRaisesRegex(RuntimeError, "canonical"):
+            manage.operate("config-reload", [str(duplicate)])
+        with self.assertRaisesRegex(RuntimeError, "at most one"):
+            manage.operate("config-reload", [str(self.canonical), "extra"])
+        self.process.assert_not_called()
 
     def test_failed_reload_preserves_file_and_does_not_claim_success(self):
         before = fingerprint(self.canonical)
@@ -312,6 +336,16 @@ class OperatorTests(unittest.TestCase):
             "-u", "minecraft-backend.service", "-n", "100", "-o", "cat", "-f",
         ])
         self.process.assert_not_called()
+
+    def test_gateway_configuration_uses_canonical_file_without_restarting(self):
+        self.process.side_effect = None
+        self.process.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        manage.operate("gateway-configure", [])
+        self.process.assert_called_once_with(
+            ["sudo", "-n", "--", sys.executable, str(self.root / "scripts/service_config.py"),
+             "--env", str(self.canonical)], text=True, capture_output=False, check=False,
+        )
+        self.execute.assert_not_called()
 
     def test_active_gateway_restart_checks_candidate_before_stopping_old_daemon(self):
         observed = []

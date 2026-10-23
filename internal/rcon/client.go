@@ -34,6 +34,7 @@ type Client struct {
 	address  string
 	password string
 	timeout  atomic.Int64
+	stats    *clientCounters
 	// Only persistent clients use the fields below. gate protects their entire
 	// exchange, connection lifecycle, request IDs, and closed flag.
 	persistent bool
@@ -47,7 +48,7 @@ func New(address, password string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	c := &Client{address: address, password: password}
+	c := &Client{address: address, password: password, stats: &clientCounters{}}
 	c.timeout.Store(int64(timeout))
 	return c
 }
@@ -92,6 +93,7 @@ func (c *Client) discard() error {
 	conn := c.conn
 	c.conn = nil
 	if conn != nil {
+		c.stats.connected.Add(-1)
 		return conn.Close()
 	}
 	return nil
@@ -160,7 +162,12 @@ func (c *Client) Command(ctx context.Context, command string) (string, error) {
 
 // CommandWithTimeout uses the same serialized connection with a per-operation
 // deadline. Operator commands can take longer than a routine health check.
-func (c *Client) CommandWithTimeout(ctx context.Context, command string, timeout time.Duration) (string, error) {
+func (c *Client) CommandWithTimeout(ctx context.Context, command string, timeout time.Duration) (response string, resultErr error) {
+	started := time.Now()
+	var contextErr error
+	c.stats.inFlight.Add(1)
+	defer c.stats.inFlight.Add(-1)
+	defer func() { c.observe(command, started, response, resultErr, contextErr) }()
 	if c.password == "" {
 		return "", errors.New("RCON password is empty")
 	}
@@ -172,15 +179,18 @@ func (c *Client) CommandWithTimeout(ctx context.Context, command string, timeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// Capture the caller/deadline outcome before our deferred cleanup cancels
+	// an otherwise healthy context; socket cancellation surfaces as a timeout.
+	defer func() { contextErr = ctx.Err() }()
 	if c.persistent {
 		return c.persistentCommand(ctx, command)
 	}
-	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", c.address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return "", fmt.Errorf("RCON connect: %w", err)
 	}
 	defer conn.Close()
+	defer c.stats.connected.Add(-1)
 	finish, err := bindContext(ctx, conn)
 	if err != nil {
 		return "", err
@@ -209,10 +219,13 @@ func bindContext(ctx context.Context, conn net.Conn) (func(), error) {
 }
 
 func (c *Client) persistentCommand(ctx context.Context, command string) (response string, err error) {
+	c.stats.queued.Add(1)
 	select {
 	case <-ctx.Done():
+		c.stats.queued.Add(-1)
 		return "", ctx.Err()
 	case c.gate <- struct{}{}:
+		c.stats.queued.Add(-1)
 	}
 	defer func() { <-c.gate }()
 	if c.closed {
@@ -227,8 +240,7 @@ func (c *Client) persistentCommand(ctx context.Context, command string) (respons
 	}
 	fresh := c.conn == nil
 	if fresh {
-		d := net.Dialer{}
-		c.conn, err = d.DialContext(ctx, "tcp", c.address)
+		c.conn, err = c.dial(ctx)
 		if err != nil {
 			return "", fmt.Errorf("RCON connect: %w", err)
 		}
@@ -268,7 +280,15 @@ func (c *Client) exchange(conn io.ReadWriter, command string) (string, error) {
 	return c.request(conn, command, commandID, boundaryID)
 }
 
-func (c *Client) authenticate(conn io.ReadWriter) error {
+func (c *Client) authenticate(conn io.ReadWriter) (resultErr error) {
+	c.stats.authenticationAttempts.Add(1)
+	defer func() {
+		if resultErr != nil {
+			c.stats.authenticationErrors.Add(1)
+		} else {
+			c.stats.authenticationSuccesses.Add(1)
+		}
+	}()
 	if err := writePacket(conn, authID, 3, c.password); err != nil {
 		return fmt.Errorf("RCON authentication write: %w", err)
 	}

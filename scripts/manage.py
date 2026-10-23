@@ -21,7 +21,7 @@ import sys
 import tempfile
 
 from env_config import (
-    MANAGE_DEFAULTS, RUNTIME_DEFAULTS, read_env, redacted_values,
+    MANAGE_DEFAULTS, RUNTIME_DEFAULTS, MAX_ENV_BYTES, parse_env, read_env, redacted_values,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,7 +46,7 @@ def task_arguments(proc_root=Path("/proc"), parent_pid=None):
     parent = proc_root / str(os.getppid() if parent_pid is None else parent_pid)
     executable = Path(os.readlink(parent / "exe")).name.removesuffix(" (deleted)")
     require(executable in ("task", "go-task"),
-            "cannot recover original arguments: invoke task command -- <Minecraft command>")
+            "cannot recover original arguments: invoke task <task-name> -- <arguments>")
     with (parent / "cmdline").open("rb") as stream:
         raw = stream.read(2 * 1024 * 1024 + 1)
     require(len(raw) <= 2 * 1024 * 1024 and raw.endswith(b"\0"),
@@ -223,16 +223,27 @@ def operate(action, arguments):
         os.umask(0o027)
         os.execvp(editor[0], editor + [str(ENV_FILE.resolve(strict=True))])
     require(ENV_FILE.exists(), "missing .env; run task config:init first")
-    values = read_env(ENV_FILE)
+    reloading = action in ("config-reload", "config-apply", "reload")
+    if reloading:
+        require(len(arguments) <= 1, "config:reload accepts at most one .env path")
+        source = Path(arguments[0]).resolve(strict=True) if arguments else ENV_FILE.resolve(strict=True)
+        require(source == ENV_FILE.resolve(strict=True),
+                "reload path must resolve to the installed canonical .env; use task config:init to restore its link")
+        with source.open("rb") as stream:
+            snapshot = stream.read(MAX_ENV_BYTES + 1)
+        values = parse_env(snapshot)
+        digest = hashlib.sha256(snapshot).hexdigest()
+    else:
+        values = read_env(ENV_FILE)
     cfg = settings(values)
     require_canonical_config(cfg)
     command_prefix = [cfg["MC_BINARY"]]
 
-    if action in ("config-show", "config-check", "config-apply", "reload"):
-        require(not arguments, "configuration tasks take no arguments")
+    if action in ("config-show", "config-check") or reloading:
+        require(reloading or not arguments, "this configuration task takes no arguments")
         if action == "config-show":
             print(json.dumps(redacted_values(values), indent=2, ensure_ascii=False))
-            print("These are .env settings with defaults; task config:apply reloads supported changes live.")
+            print("These are .env settings with defaults; task config:reload -- .env applies supported changes live.")
             return
         if action == "config-check":
             sudo(command_prefix + ["check", "--config", cfg["MC_CONFIG"]],
@@ -240,7 +251,8 @@ def operate(action, arguments):
             print(".env is valid and readable by the service account. No files or services changed.")
             return
         sudo(command_prefix + ["reload", "--socket", cfg["MC_ADMIN_SOCKET"],
-                               "--config", cfg["MC_CONFIG"]], user=cfg["MC_SERVICE_USER"])
+                               "--env", str(source), "--expected-sha256", digest],
+             user=cfg["MC_SERVICE_USER"])
         print("Configuration reload completed through the control socket. No service restart was requested.")
         return
 
@@ -257,6 +269,12 @@ def operate(action, arguments):
         print("Gateway and Minecraft processes were left running.")
         return
 
+    if action == "gateway-configure":
+        require(not arguments, "gateway:configure takes no arguments")
+        sudo([sys.executable, str(ROOT / "scripts/service_config.py"),
+              "--env", cfg["MC_CONFIG"]])
+        return
+
     if action.startswith("logs"):
         server = "server" in action
         follow = action.endswith("follow")
@@ -266,7 +284,7 @@ def operate(action, arguments):
         argv += ["-f"] if follow else ["--no-pager"]
         os.execvp(argv[0], argv + arguments)
 
-    if action in ("status", "config-live", "start", "stop", "command", "version"):
+    if action in ("status", "metrics", "config-live", "start", "stop", "command", "version"):
         if action == "command":
             argv = command_prefix + ["command", "--socket", cfg["MC_ADMIN_SOCKET"],
                                      "--timeout", str(cfg["MC_COMMAND_TIMEOUT"]), "--"] + arguments
@@ -300,7 +318,7 @@ def main():
     arguments = args.arguments
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
-    if args.action == "command" and arguments == ["--task-args"]:
+    if args.action in ("command", "config-reload", "config-apply", "reload") and arguments == ["--task-args"]:
         arguments = task_arguments()
     if args.action == "_deploy":
         require(len(arguments) == 4, "invalid install arguments")

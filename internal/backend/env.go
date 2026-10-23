@@ -45,19 +45,29 @@ func LoadEnv(data []byte) (Config, error) {
 		"MC_BOOT_MESSAGE":      &c.BootMessage,
 		"MC_SLEEPING_MOTD":     &c.SleepingMOTD,
 		"MC_STARTING_MOTD":     &c.StartingMOTD,
+		"MC_STOPPING_MOTD":     &c.StoppingMOTD,
+		"MC_UNKNOWN_MOTD":      &c.UnknownMOTD,
 		"MC_FAILED_MOTD":       &c.FailedMOTD,
+		"MC_MOTD":              &c.MOTD,
+		"MC_RESTART_MESSAGE":   &c.RestartMessage,
+		"MC_WHITELIST_MESSAGE": &c.WhitelistMessage,
+		"MC_METRICS_LISTEN":    &c.MetricsListen,
 		"MC_LOG_LEVEL":         &c.LogLevel,
 	}
 	durationFields := map[string]*Duration{
-		"MC_IDLE_TIMEOUT":        &c.IdleTimeout,
-		"MC_POLL_INTERVAL":       &c.PollInterval,
-		"MC_OPERATION_TIMEOUT":   &c.OperationTimeout,
-		"MC_STARTUP_TIMEOUT":     &c.StartupTimeout,
-		"MC_SHUTDOWN_WARN_AFTER": &c.ShutdownWarnAfter,
-		"MC_WAKE_COOLDOWN":       &c.WakeCooldown,
-		"MC_HANDSHAKE_TIMEOUT":   &c.HandshakeTimeout,
-		"MC_DIAL_TIMEOUT":        &c.DialTimeout,
+		"MC_IDLE_TIMEOUT":            &c.IdleTimeout,
+		"MC_POLL_INTERVAL":           &c.PollInterval,
+		"MC_OPERATION_TIMEOUT":       &c.OperationTimeout,
+		"MC_STARTUP_TIMEOUT":         &c.StartupTimeout,
+		"MC_SHUTDOWN_WARN_AFTER":     &c.ShutdownWarnAfter,
+		"MC_WAKE_COOLDOWN":           &c.WakeCooldown,
+		"MC_HANDSHAKE_TIMEOUT":       &c.HandshakeTimeout,
+		"MC_DIAL_TIMEOUT":            &c.DialTimeout,
+		"MC_RESTART_GRACE":           &c.RestartGrace,
+		"MC_METRICS_POLL_INTERVAL":   &c.MetricsPollInterval,
+		"MC_METRICS_PLAYER_INTERVAL": &c.MetricsPlayerInterval,
 	}
+	booleanFields := map[string]*bool{"MC_OVERRIDE_MOTD": &c.OverrideMOTD, "MC_METRICS_ENABLED": &c.MetricsEnabled, "MC_METRICS_PLAYER_DETAILS": &c.MetricsPlayerDetails}
 	var logLines int
 	integerFields := map[string]*int{
 		"MC_PROTOCOL":        &c.Protocol,
@@ -85,7 +95,7 @@ func LoadEnv(data []byte) (Config, error) {
 			return c, envError(number, "", "expected KEY=value")
 		}
 		key, literal := parts[1], parts[2]
-		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && !taskFields[key] && key != "MC_LAUNCH_ARGS" {
+		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && booleanFields[key] == nil && !taskFields[key] && key != "MC_LAUNCH_ARGS" {
 			return c, envError(number, key, "unknown setting")
 		}
 		if seen[key] {
@@ -95,6 +105,17 @@ func LoadEnv(data []byte) (Config, error) {
 		value, err := parseEnvValue(literal)
 		if err != nil {
 			return c, envError(number, key, err.Error())
+		}
+		if target := booleanFields[key]; target != nil {
+			switch strings.ToLower(value) {
+			case "true":
+				*target = true
+			case "false":
+				*target = false
+			default:
+				return c, envError(number, key, "must be true or false")
+			}
+			continue
 		}
 		if target := integerFields[key]; target != nil {
 			if !decimalDigits(value) {
@@ -174,7 +195,7 @@ func validateEnvString(key, value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("must not be empty")
 	}
-	message := key == "MC_BOOT_MESSAGE" || key == "MC_SLEEPING_MOTD" || key == "MC_STARTING_MOTD" || key == "MC_FAILED_MOTD"
+	message := key == "MC_BOOT_MESSAGE" || key == "MC_SLEEPING_MOTD" || key == "MC_STARTING_MOTD" || key == "MC_STOPPING_MOTD" || key == "MC_UNKNOWN_MOTD" || key == "MC_FAILED_MOTD" || key == "MC_MOTD" || key == "MC_WHITELIST_MESSAGE"
 	if strings.ContainsAny(value, "\x00\r") {
 		return fmt.Errorf("must not contain NUL or carriage return")
 	}

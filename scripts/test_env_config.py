@@ -69,6 +69,29 @@ class EnvConfigTests(unittest.TestCase):
         }
         self.assertEqual(self.read(env_config.serialize_env(values)), values)
 
+    def test_booleans_are_explicit_typed_and_round_trip(self):
+        values = self.read("MC_OVERRIDE_MOTD=TRUE\nMC_METRICS_ENABLED='false'\n"
+                           'MC_METRICS_PLAYER_DETAILS="True"\n')
+        self.assertEqual(values, {"MC_OVERRIDE_MOTD": True, "MC_METRICS_ENABLED": False,
+                                  "MC_METRICS_PLAYER_DETAILS": True})
+        self.assertEqual(self.read(env_config.serialize_env(values)), values)
+        self.assertEqual(env_config.render_config(values, {})["metrics_enabled"], False)
+        for invalid in ("1", "0", "t", "f", "yes", "off", " true ", 1, 0, None, [], {}):
+            with self.subTest(invalid=invalid), self.assertRaises(env_config.EnvConfigError):
+                env_config.validate_values({"MC_METRICS_ENABLED": invalid})
+
+    def test_restart_reason_is_single_line_and_messages_have_utf8_bounds(self):
+        for invalid in ("first\nsecond", "first\rsecond", "first\x00second", "é" * 2049):
+            with self.subTest(invalid=invalid[:25]), self.assertRaises(env_config.EnvConfigError):
+                env_config.validate_values({"MC_RESTART_MESSAGE": invalid})
+        self.assertEqual(env_config.validate_values({"MC_MOTD": "First\nSecond"}),
+                         {"MC_MOTD": "First\nSecond"})
+        for key in env_config.MESSAGE_KEYS | {"MC_RESTART_MESSAGE"}:
+            with self.subTest(key=key):
+                self.assertEqual(env_config.validate_values({key: "é" * 2048})[key], "é" * 2048)
+                with self.assertRaisesRegex(env_config.EnvConfigError, "4096"):
+                    env_config.validate_values({key: "é" * 2049})
+
     def test_all_go_configuration_fields_are_mapped(self):
         source = (ROOT / "internal/backend/config.go").read_text()
         struct = re.search(r"type Config struct \{(.*?)\n\}", source, re.DOTALL)
@@ -208,7 +231,7 @@ class EnvConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(env_config.EnvConfigError, "exceeds 64 KiB"):
             self.read("#" + "é" * (env_config.MAX_ENV_BYTES // 2))
         with self.assertRaisesRegex(env_config.EnvConfigError, "exceeds 64 KiB"):
-            env_config.serialize_env({"MC_BOOT_MESSAGE": "x" * env_config.MAX_ENV_BYTES})
+            env_config.serialize_env({"MC_VERSION": "x" * env_config.MAX_ENV_BYTES})
 
 
 if __name__ == "__main__":

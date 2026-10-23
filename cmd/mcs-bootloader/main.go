@@ -31,7 +31,7 @@ func run(args []string) error {
 	if command == "command" {
 		return runCommand(args, os.Stdout)
 	}
-	if command == "status" || command == "wake" || command == "sleep" || command == "reload" || command == "config" || command == "restart-check" {
+	if command == "status" || command == "wake" || command == "sleep" || command == "reload" || command == "config" || command == "restart-check" || command == "metrics" {
 		return adminClient(command, args)
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -95,6 +95,6 @@ func run(args []string) error {
 		fmt.Println("configuration and password permissions are valid")
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q; use serve, check, status, config, reload, restart-check, wake, sleep, command, backend-start, backend-stop, or version", command)
+		return fmt.Errorf("unknown command %q; use serve, check, status, config, reload, restart-check, wake, sleep, command, metrics, backend-start, backend-stop, or version", command)
 	}
 }

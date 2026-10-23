@@ -12,7 +12,8 @@ WorkingDirectory=/
 ExecStart=/opt/mcs-bootloader/bin/mcs-bootloader serve --config /etc/mcs-bootloader/.env
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=15s
+# The daemon bounds RCON notification and relay draining using its .env timers.
+TimeoutStopSec=infinity
 RuntimeDirectory=mcs-bootloader
 RuntimeDirectoryMode=0700
 StateDirectory=mcs-bootloader
@@ -20,7 +21,8 @@ StateDirectoryMode=0700
 UMask=0077
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=true
+# Read native whitelist files and same-account JVM metrics, including /home installs.
+ProtectHome=read-only
 # A narrowly scoped sudo rule starts only the backend unit.
 # NoNewPrivileges would disable that rule.
 NoNewPrivileges=false

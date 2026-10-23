@@ -1,7 +1,7 @@
 """Read gateway .env settings as data, without a shell or environment expansion.
 
-``read_env`` returns only settings explicitly present in the file. Integer
-settings become Python ints; all other settings remain strings. The same file is
+``read_env`` returns only settings explicitly present in the file. Integer and
+boolean settings become typed values; other settings remain strings. The same file is
 read directly by the Go daemon and the task helper. It is never sourced in a
 shell, exported to subprocesses, or rendered into a second active config file.
 
@@ -42,10 +42,22 @@ CONFIG_KEYS = {
     "MC_WAKE_COOLDOWN": "wake_cooldown",
     "MC_HANDSHAKE_TIMEOUT": "handshake_timeout",
     "MC_DIAL_TIMEOUT": "dial_timeout",
+    "MC_RESTART_GRACE": "restart_grace",
     "MC_BOOT_MESSAGE": "boot_message",
+    "MC_RESTART_MESSAGE": "restart_message",
+    "MC_WHITELIST_MESSAGE": "whitelist_message",
     "MC_SLEEPING_MOTD": "sleeping_motd",
     "MC_STARTING_MOTD": "starting_motd",
+    "MC_STOPPING_MOTD": "stopping_motd",
+    "MC_UNKNOWN_MOTD": "unknown_motd",
     "MC_FAILED_MOTD": "failed_motd",
+    "MC_OVERRIDE_MOTD": "override_motd",
+    "MC_MOTD": "motd",
+    "MC_METRICS_ENABLED": "metrics_enabled",
+    "MC_METRICS_LISTEN": "metrics_listen",
+    "MC_METRICS_POLL_INTERVAL": "metrics_poll_interval",
+    "MC_METRICS_PLAYER_INTERVAL": "metrics_player_interval",
+    "MC_METRICS_PLAYER_DETAILS": "metrics_player_details",
     "MC_LOG_LEVEL": "log_level",
 }
 
@@ -73,10 +85,22 @@ RUNTIME_DEFAULTS = {
     "MC_WAKE_COOLDOWN": "30s",
     "MC_HANDSHAKE_TIMEOUT": "5s",
     "MC_DIAL_TIMEOUT": "3s",
+    "MC_RESTART_GRACE": "3s",
     "MC_BOOT_MESSAGE": "Server is booting up. Please reconnect in a few minutes.",
+    "MC_RESTART_MESSAGE": "Gateway is restarting. Please reconnect in a moment.",
+    "MC_WHITELIST_MESSAGE": "You are not whitelisted on this server.",
     "MC_SLEEPING_MOTD": "Server is sleeping. Join to start it.",
     "MC_STARTING_MOTD": "Server is booting up. Please wait...",
+    "MC_STOPPING_MOTD": "Server is saving and going to sleep. Please reconnect shortly.",
+    "MC_UNKNOWN_MOTD": "Checking server health. Please reconnect shortly.",
     "MC_FAILED_MOTD": "Server is unavailable. Please try again shortly.",
+    "MC_OVERRIDE_MOTD": False,
+    "MC_MOTD": "Minecraft server",
+    "MC_METRICS_ENABLED": False,
+    "MC_METRICS_LISTEN": "127.0.0.1:9464",
+    "MC_METRICS_POLL_INTERVAL": "15s",
+    "MC_METRICS_PLAYER_INTERVAL": "60s",
+    "MC_METRICS_PLAYER_DETAILS": True,
     "MC_LOG_LEVEL": "info",
 }
 
@@ -94,8 +118,12 @@ MANAGE_DEFAULTS = {
 INTEGER_KEYS = frozenset({
     "MC_PROTOCOL", "MC_MAX_PLAYERS", "MC_MAX_CONNECTIONS", "MC_LOG_LINES",
 })
+BOOLEAN_KEYS = frozenset({
+    "MC_OVERRIDE_MOTD", "MC_METRICS_ENABLED", "MC_METRICS_PLAYER_DETAILS",
+})
 MESSAGE_KEYS = frozenset({
     "MC_BOOT_MESSAGE", "MC_SLEEPING_MOTD", "MC_STARTING_MOTD", "MC_FAILED_MOTD",
+    "MC_STOPPING_MOTD", "MC_UNKNOWN_MOTD", "MC_MOTD", "MC_WHITELIST_MESSAGE",
 })
 SUPPORTED_KEYS = frozenset(CONFIG_KEYS) | frozenset(MANAGE_DEFAULTS)
 _ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)")
@@ -126,6 +154,12 @@ def _validate_key(key, line=None):
 
 
 def _validate_value(key, value, line=None):
+    if key in BOOLEAN_KEYS:
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        if type(value) is bool:
+            return value
+        _error("must be true or false", key, line)
     if key in INTEGER_KEYS:
         if isinstance(value, str):
             if not re.fullmatch(r"[0-9]+", value):
@@ -154,6 +188,8 @@ def _validate_value(key, value, line=None):
     except UnicodeEncodeError:
         _error("must contain valid Unicode", key, line)
     if key == "MC_LAUNCH_EXECUTABLE" and len(value.encode("utf-8")) > 4096:
+        _error("must be at most 4096 UTF-8 bytes", key, line)
+    if (key in MESSAGE_KEYS or key == "MC_RESTART_MESSAGE") and len(value.encode("utf-8")) > 4096:
         _error("must be at most 4096 UTF-8 bytes", key, line)
     if key == "MC_LAUNCH_ARGS":
         launch_arguments(value, line=line)
@@ -229,6 +265,11 @@ def read_env(path):
     """Read at most 64 KiB of UTF-8 settings; never execute or expand values."""
     with Path(path).open("rb") as stream:
         raw = stream.read(MAX_ENV_BYTES + 1)
+    return parse_env(raw)
+
+
+def parse_env(raw):
+    """Parse one bounded byte snapshot, also used for hash-bound socket reloads."""
     if len(raw) > MAX_ENV_BYTES:
         _error("environment file exceeds 64 KiB")
     invalid_offsets = [raw.find(char) for char in (b"\r", b"\x00") if char in raw]
@@ -290,7 +331,7 @@ def values_from_config(base_dict, *, include_manage_defaults=True):
 def redacted_values(values):
     """Return effective local settings safe to display, without the credential.
 
-    These describe the file, which may still await ``task config:apply``. Missing
+    These describe the file, which may still await ``task config:reload``. Missing
     required startup settings remain absent so no invented path is presented as
     an installed Minecraft loader.
     """

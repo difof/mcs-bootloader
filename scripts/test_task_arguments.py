@@ -33,7 +33,7 @@ class TaskArgumentsTests(unittest.TestCase):
             task_arguments(self.root, 123)
         (self.parent / "exe").unlink()
         (self.parent / "exe").symlink_to("/bin/bash")
-        with self.assertRaisesRegex(RuntimeError, "invoke task command"):
+        with self.assertRaisesRegex(RuntimeError, "invoke task <task-name>"):
             task_arguments(self.root, 123)
 
 

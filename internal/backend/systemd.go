@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/difof/mcs-bootloader/internal/mcproto"
@@ -20,6 +22,7 @@ type Systemd struct {
 	Protocol int
 	RCON     *rcon.Client
 	mu       sync.RWMutex
+	mainPID  atomic.Int64
 }
 
 func (s *Systemd) Start(ctx context.Context) error {
@@ -33,9 +36,10 @@ func (s *Systemd) Start(ctx context.Context) error {
 }
 
 func (s *Systemd) Running(ctx context.Context) (bool, error) {
-	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", s.Service, "--property=LoadState", "--property=ActiveState")
+	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", s.Service, "--property=LoadState", "--property=ActiveState", "--property=MainPID")
 	out, err := cmd.Output()
 	if err != nil {
+		s.mainPID.Store(0)
 		return false, fmt.Errorf("inspect backend service: %w", err)
 	}
 	values := make(map[string]string)
@@ -46,18 +50,36 @@ func (s *Systemd) Running(ctx context.Context) (bool, error) {
 		}
 	}
 	if values["LoadState"] != "loaded" {
+		s.mainPID.Store(0)
 		return false, fmt.Errorf("backend service is not loaded")
 	}
+	pid, _ := strconv.ParseInt(values["MainPID"], 10, 32)
+	if pid < 0 {
+		pid = 0
+	}
+	s.mainPID.Store(pid)
 	switch values["ActiveState"] {
 	case "active", "activating", "reloading", "refreshing":
 		return true, nil
 	case "deactivating":
 		return true, fmt.Errorf("backend service is stopping")
 	case "inactive", "failed":
+		s.mainPID.Store(0)
 		return false, nil
 	default:
+		s.mainPID.Store(0)
 		return false, fmt.Errorf("unknown backend service state %q", values["ActiveState"])
 	}
+}
+
+// MainPID is the last lifecycle inspection's PID; it never starts a process or
+// queries systemd during a metrics scrape. Collectors verify /proc start time.
+func (s *Systemd) MainPID() int { return int(s.mainPID.Load()) }
+
+func (s *Systemd) RCONStats() rcon.Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.RCON.Stats()
 }
 
 func (s *Systemd) Players(ctx context.Context) (int, error) {
@@ -84,8 +106,8 @@ func (s *Systemd) ReconfigureRCON(password string, timeout time.Duration, replac
 	defer s.mu.Unlock()
 	if replace {
 		old := s.RCON
-		s.RCON = rcon.NewPersistent(old.Address(), password, timeout)
 		_ = old.Close()
+		s.RCON = old.Replacement(password, timeout)
 	} else {
 		s.RCON.SetTimeout(timeout)
 	}

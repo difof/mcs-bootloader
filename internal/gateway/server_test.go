@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -80,6 +82,12 @@ func startGateway(t *testing.T, cfg Config, controller *fakeController) (*Server
 	}
 	if cfg.BackendAddress == "" {
 		cfg.BackendAddress = "127.0.0.1:1"
+	}
+	if cfg.ServerDirectory == "" {
+		cfg.ServerDirectory = t.TempDir()
+		if err := os.WriteFile(filepath.Join(cfg.ServerDirectory, "server.properties"), []byte("white-list=false\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if cfg.HandshakeTimeout == 0 {
 		cfg.HandshakeTimeout = 2 * time.Second
@@ -323,7 +331,8 @@ func TestUnknownPlayerHealthBlocksBackendDial(t *testing.T) {
 
 func TestStoppingLoginRequestsRetryWithoutJoining(t *testing.T) {
 	controller := &fakeController{state: control.Stopping}
-	_, address, _ := startGateway(t, Config{}, controller)
+	cfg := Config{StoppingMOTD: "Saving the server; reconnect once it has stopped"}
+	_, address, _ := startGateway(t, cfg, controller)
 	client := dialClient(t, address)
 	if err := writeAll(client, append(handshakePacket("friends.example", 2), loginPacket("Mzar")...)); err != nil {
 		t.Fatal(err)
@@ -332,7 +341,7 @@ func TestStoppingLoginRequestsRetryWithoutJoining(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(payload, []byte("saving and shutting down")) {
+	if !bytes.Contains(payload, []byte(cfg.StoppingMOTD)) {
 		t.Fatalf("wrong stopping message: %s", payload)
 	}
 	if controller.Snapshot().ActiveConnections != 0 {

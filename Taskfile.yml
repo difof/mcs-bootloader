@@ -63,14 +63,15 @@ tasks:
       - task: build
       - task: deploy:binary
   deploy:binary:
-    desc: Install a bundled update without rebuilding or restarting either service
+    desc: Install a bundled update and gateway service settings without restarting either service
     cmds:
       - python3 scripts/manage.py deploy
+      - task: gateway:configure
   release:package:
-    desc: 'Check and package both Linux architectures locally: task release:package VERSION=v0.3.0 (never tags or publishes)'
+    desc: 'Check and package both Linux architectures locally: task release:package VERSION=v0.4.0 (never tags or publishes)'
     preconditions:
       - sh: python3 scripts/release.py check-version --version {{.VERSION | shellQuote}}
-        msg: Supply a stable semantic version such as VERSION=v0.3.0
+        msg: Supply a stable semantic version such as VERSION=v0.4.0
     cmds:
       - task: check
       - python3 scripts/release.py package --version {{.VERSION | shellQuote}}
@@ -84,6 +85,11 @@ tasks:
     silent: true
     cmds:
       - python3 scripts/manage.py version {{.CLI_ARGS}}
+  metrics:
+    desc: Show the enabled exporter's cached Prometheus metrics through the private socket
+    silent: true
+    cmds:
+      - python3 scripts/manage.py metrics {{.CLI_ARGS}}
   start:
     aliases: [wake]
     desc: Start Minecraft once; joining also wakes it automatically
@@ -151,17 +157,27 @@ tasks:
     silent: true
     cmds:
       - python3 scripts/manage.py config-check {{.CLI_ARGS}}
-  config:apply:
+  config:reload:
     aliases: [reload]
-    desc: Apply supported .env changes through the control socket without restarting
+    desc: 'Re-read the canonical .env through the socket: task config:reload -- .env'
     silent: true
     cmds:
-      - python3 scripts/manage.py config-apply {{.CLI_ARGS}}
+      - python3 scripts/manage.py config-reload --task-args
+  config:apply:
+    desc: Compatibility alias for config:reload; accepts the same optional .env path
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-reload --task-args
   gateway:start:
     desc: Start the gateway service (does not directly start Minecraft)
     silent: true
     cmds:
       - python3 scripts/manage.py gateway-start {{.CLI_ARGS}}
+  gateway:configure:
+    desc: Refresh gateway sandbox/drain settings; no process restart or Minecraft changes
+    silent: true
+    cmds:
+      - python3 scripts/manage.py gateway-configure {{.CLI_ARGS}}
   gateway:stop:
     desc: Stop gateway and disconnect clients; leave Java running; disables wake until started
     silent: true

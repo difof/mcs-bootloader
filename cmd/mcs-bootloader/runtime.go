@@ -11,32 +11,38 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/difof/mcs-bootloader/internal/backend"
 	"github.com/difof/mcs-bootloader/internal/control"
 	"github.com/difof/mcs-bootloader/internal/gateway"
+	"github.com/difof/mcs-bootloader/internal/telemetry"
 )
 
 // runtimeConfig keeps the applied configuration separate from edits on disk.
 // A reload is serialized with wake/sleep, validates everything before commit,
 // and never replaces the listener or touches established game connections.
 type runtimeConfig struct {
-	reloadMu   sync.Mutex
-	mu         sync.RWMutex
-	cfg        backend.Config
-	path       string
-	digest     string
-	generation uint64
-	controller *control.Controller
-	gateway    *gateway.Server
-	backend    runtimeBackend
-	level      *slog.LevelVar
-	log        *slog.Logger
+	reloadMu     sync.Mutex
+	mu           sync.RWMutex
+	cfg          backend.Config
+	path         string
+	digest       string
+	generation   uint64
+	controller   *control.Controller
+	gateway      *gateway.Server
+	backend      runtimeBackend
+	level        *slog.LevelVar
+	log          *slog.Logger
+	metrics      *telemetry.Manager
+	shuttingDown atomic.Bool
 }
 
 type runtimeBackend interface {
@@ -48,6 +54,7 @@ type runtimeBackend interface {
 type configMetadata struct {
 	Generation uint64 `json:"generation"`
 	SHA256     string `json:"sha256"`
+	Source     string `json:"source"`
 }
 type reloadResult struct {
 	configMetadata
@@ -56,7 +63,7 @@ type reloadResult struct {
 }
 
 func readConfigSnapshot(path string) (backend.Config, string, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return backend.Config{}, "", err
 	}
@@ -114,10 +121,18 @@ func trafficConfig(cfg backend.Config) gateway.Config {
 		"players":     map[string]any{"max": cfg.MaxPlayers, "online": 0, "sample": []any{}},
 		"description": cfg.SleepingMOTD, "isModded": true,
 	})
-	return gateway.Config{BackendAddress: cfg.BackendAddress, Protocol: cfg.Protocol, MaxConnections: cfg.MaxConnections,
+	return gateway.Config{BackendAddress: cfg.BackendAddress, ServerDirectory: cfg.ServerDirectory, Protocol: cfg.Protocol, MaxConnections: cfg.MaxConnections,
 		HandshakeTimeout: time.Duration(cfg.HandshakeTimeout), DialTimeout: time.Duration(cfg.DialTimeout),
 		BootMessage: cfg.BootMessage, SleepingMOTD: cfg.SleepingMOTD, StartingMOTD: cfg.StartingMOTD,
-		FailedMOTD: cfg.FailedMOTD, FallbackStatus: fallback}
+		StoppingMOTD: cfg.StoppingMOTD, UnknownMOTD: cfg.UnknownMOTD, FailedMOTD: cfg.FailedMOTD,
+		OverrideMOTD: cfg.OverrideMOTD, MOTD: cfg.MOTD, RestartMessage: cfg.RestartMessage,
+		WhitelistMessage: cfg.WhitelistMessage, FallbackStatus: fallback}
+}
+func metricsConfig(cfg backend.Config) telemetry.Config {
+	return telemetry.Config{Enabled: cfg.MetricsEnabled, Listen: cfg.MetricsListen,
+		PollInterval: time.Duration(cfg.MetricsPollInterval), OperationTimeout: time.Duration(cfg.OperationTimeout),
+		PlayerInterval: time.Duration(cfg.MetricsPlayerInterval),
+		PlayerDetails:  cfg.MetricsPlayerDetails, ServerDirectory: cfg.ServerDirectory}
 }
 func parseLogLevel(value string) slog.Level {
 	if value == "debug" {
@@ -131,7 +146,7 @@ func parseLogLevel(value string) slog.Level {
 func (m *runtimeConfig) snapshot() (backend.Config, configMetadata) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cfg.Clone(), configMetadata{Generation: m.generation, SHA256: m.digest}
+	return m.cfg.Clone(), configMetadata{Generation: m.generation, SHA256: m.digest, Source: m.path}
 }
 
 func restartFields(old, next backend.Config) []string {
@@ -178,15 +193,23 @@ func changedFields(old, next backend.Config) []string {
 	return changed
 }
 
-func (m *runtimeConfig) reload(ctx context.Context, expected string) (reloadResult, error) {
+func (m *runtimeConfig) reload(ctx context.Context, expected string, requestedPath ...string) (reloadResult, error) {
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
+	if m.shuttingDown.Load() {
+		return reloadResult{}, errors.New("gateway is shutting down")
+	}
+	if len(requestedPath) > 0 && requestedPath[0] != "" {
+		if err := sameConfigSource(m.path, requestedPath[0]); err != nil {
+			return reloadResult{}, err
+		}
+	}
 	next, digest, err := readConfigSnapshot(m.path)
 	if err != nil {
 		return reloadResult{}, fmt.Errorf("reload rejected: %w", err)
 	}
 	if expected != "" && digest != expected {
-		return reloadResult{}, errors.New(".env changed after the request was prepared; run task config:apply again")
+		return reloadResult{}, errors.New(".env changed after the request was prepared; run task config:reload again")
 	}
 	old, metadata := m.snapshot()
 	if digest == metadata.SHA256 {
@@ -204,7 +227,18 @@ func (m *runtimeConfig) reload(ctx context.Context, expected string) (reloadResu
 	}
 	passwordChanged := old.RCONPassword != next.RCONPassword
 	changed := changedFields(old, next)
+	var prepared *telemetry.Prepared
+	if m.metrics != nil {
+		prepared, err = m.metrics.Prepare(metricsConfig(next))
+		if err != nil {
+			return reloadResult{}, fmt.Errorf("reload rejected: %w", err)
+		}
+		defer prepared.Abort()
+	}
 	err = m.controller.ReconfigureWith(ctx, lifecycle, func() error {
+		if m.shuttingDown.Load() {
+			return errors.New("gateway is shutting down")
+		}
 		if passwordChanged {
 			checkCtx, cancel := context.WithTimeout(context.Background(), time.Duration(old.OperationTimeout))
 			running, err := m.backend.Running(checkCtx)
@@ -227,8 +261,11 @@ func (m *runtimeConfig) reload(ctx context.Context, expected string) (reloadResu
 		m.cfg = next.Clone()
 		m.digest = digest
 		m.generation++
-		metadata = configMetadata{Generation: m.generation, SHA256: m.digest}
+		metadata = configMetadata{Generation: m.generation, SHA256: m.digest, Source: m.path}
 		m.mu.Unlock()
+		if prepared != nil {
+			prepared.Commit()
+		}
 		return nil
 	})
 	if err != nil {
@@ -238,6 +275,31 @@ func (m *runtimeConfig) reload(ctx context.Context, expected string) (reloadResu
 	return reloadResult{configMetadata: metadata, Applied: true, Changed: changed}, nil
 }
 
+// A reload may name the source explicitly, but cannot silently switch the
+// daemon to a second .env that a future service restart would not read.
+func sameConfigSource(current, requested string) error {
+	if !filepath.IsAbs(requested) {
+		return errors.New("reload .env path must be absolute")
+	}
+	canonicalCurrent, err := filepath.EvalSymlinks(current)
+	if err != nil {
+		return fmt.Errorf("inspect active configuration source: %w", err)
+	}
+	canonicalRequested, err := filepath.EvalSymlinks(requested)
+	if err != nil {
+		return fmt.Errorf("inspect requested configuration source: %w", err)
+	}
+	if filepath.Clean(canonicalCurrent) == filepath.Clean(canonicalRequested) {
+		return nil
+	}
+	currentInfo, currentErr := os.Stat(current)
+	requestedInfo, requestedErr := os.Stat(requested)
+	if currentErr == nil && requestedErr == nil && os.SameFile(currentInfo, requestedInfo) {
+		return nil
+	}
+	return errors.New("reload .env must be the daemon's configured source (symlink aliases are allowed); changing the source requires a gateway restart")
+}
+
 // Commands use the applied secret and the existing serialized RCON connection.
 // Editing .env does not silently alter command authentication before a reload.
 func (m *runtimeConfig) command(ctx context.Context, command string, timeout time.Duration) (string, error) {
@@ -245,6 +307,9 @@ func (m *runtimeConfig) command(ctx context.Context, command string, timeout tim
 	// credential used for its exchange, including during password rotation.
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
+	if m.shuttingDown.Load() {
+		return "", errors.New("gateway is shutting down")
+	}
 	cfg, _ := m.snapshot()
 	reply, err := m.backend.Command(ctx, command, timeout)
 	if err != nil {

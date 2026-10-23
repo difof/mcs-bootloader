@@ -1,18 +1,19 @@
 # mcs-bootloader
 
-Keep a heavy Minecraft server asleep when nobody is playing. A small Go gateway stays online, wakes Minecraft on a login attempt, and gracefully stops it after an hour with no players.
+Keep a heavy Minecraft server asleep when nobody is playing. A small Go gateway stays online, wakes Minecraft on an allowed login attempt, and gracefully stops it after a configurable idle period (default **1 hour**).
 
 **Supported:** Linux with systemd, Minecraft Java **1.21.1 / protocol 767**, including modded servers. This is a TCP gateway: once Minecraft is ready, the original handshake and all game/mod traffic pass through unchanged.
 
 - Server-list refreshes show status without starting Minecraft.
 - Joining while asleep starts the server once and shows a **“server booting, please reconnect”** message. Reconnect when it is ready; there is no simulated lobby or indefinite loading screen.
 - Shutdown uses loopback RCON `stop`. Unknown player counts and active joins prevent sleep. The backend has no restart loop and is never force-killed.
+- Minecraft's native whitelist controls who may wake/join through the gateway. Optional Prometheus metrics cover the gateway, Minecraft, RCON, players, whitelist, and JVM.
 - Logs cover state changes and useful errors; routine polling and status pings are quiet.
 
 ## Requirements
 
 - An existing, working Minecraft server and the Java/runtime required by its modpack.
-- Linux with systemd and journald namespace support, Python **3.10+**, [Task 3](https://taskfile.dev/docs/installation), `sudo`, GNU `tar`, `zstd`, and standard system tools (`runuser`, `sha256sum`).
+- Linux with systemd/journald namespaces and `busctl`, Python **3.10+**, [Task 3](https://taskfile.dev/docs/installation), `sudo`, GNU `tar`, `zstd`, and standard tools (`runuser`, `sha256sum`, `getconf`).
 - A non-root account that owns the Minecraft files, plus an operator account with sudo access. Tasks use noninteractive sudo; run `sudo -v` first if your setup requires a password.
 - For **source builds only**: [Go 1.24+](https://go.dev/dl/), Git, and a C compiler for the race tests. Release packages include the compiled binary.
 
@@ -34,7 +35,7 @@ task backup
 task install
 ```
 
-For a prebuilt install, download the appropriate `linux_amd64` or `linux_arm64` archive and `SHA256SUMS` from [Releases](https://github.com/difof/mcs-bootloader/releases), verify the archive with `sha256sum --check --ignore-missing SHA256SUMS`, and extract it. Inside its directory, run the same configuration and backup tasks, then **`task install:binary`**. Release downloads appear after the first intentional release tag.
+For a prebuilt install, download the appropriate `linux_amd64` or `linux_arm64` archive and `SHA256SUMS` from [Releases](https://github.com/difof/mcs-bootloader/releases), verify the archive with `sha256sum --check --ignore-missing SHA256SUMS`, and extract it. Inside its directory, run the same configuration and backup tasks, then **`task install:binary`**.
 
 `task backup` saves the **whole server**, including mods and custom world directory names, to the new/empty `MC_BACKUP_DIRECTORY`. It verifies the compressed archive and checksum; it never overwrites an existing backup. The automatic backup does not support symlinks pointing outside the server root.
 
@@ -74,10 +75,49 @@ After installation, project `.env` links to **`/etc/mcs-bootloader/.env`**. All 
 ```sh
 task config:edit
 task config:check
-task config:apply
+task config:reload -- .env
 ```
 
-Timers, messages, connection limits and log level apply through the private Unix socket without a restart. Launch executable/arguments require `task gateway:restart` and take effect on Minecraft's next start. Password changes require Minecraft to be stopped before applying. Network addresses and service paths are installation settings; changing them needs a coordinated migration.
+The task resolves the path and sends it with a file digest through the private Unix socket. The daemon validates and atomically applies that snapshot. It never writes `.env`; a supplied path must resolve to the current canonical file. `task config:apply` remains an alias.
+
+Timers, messages, connection limits, MOTD overrides, metrics settings and log level apply live. A bad value or unavailable metrics port leaves the applied configuration intact. Launch executable/arguments require `task gateway:restart` and affect Minecraft's next start. Password changes require Minecraft to be stopped before applying. Game/RCON addresses and service paths are installation settings that need a coordinated migration.
+
+### MOTD and restart messages
+
+```dotenv
+MC_OVERRIDE_MOTD=true
+MC_MOTD="Our modded server\nJoin to wake it up"
+MC_RESTART_MESSAGE="Gateway is restarting. Please reconnect in a moment."
+MC_RESTART_GRACE=3s
+```
+
+The override replaces the description in every server-list response, including while Minecraft is running, while preserving the other status/mod metadata. Leave it false to use Minecraft's own online MOTD and the configured sleep/boot/error messages. On a controlled gateway stop/restart, Minecraft sends the restart reason using its native `kick` command before relays close. Java stays running. A crash or unavailable RCON cannot guarantee a reason reaches the client.
+
+### Native whitelist
+
+Use normal Minecraft commands, in game or through Task:
+
+```sh
+task command -- whitelist add PlayerName
+task command -- whitelist reload
+task command -- whitelist on
+```
+
+The gateway reads `white-list` in `server.properties` and names in `whitelist.json`. Changes are visible on the next login and metrics poll; no gateway reload is needed. Disabled means no whitelist check. Unreadable or malformed enabled policy rejects admission without waking the server. The gateway checks the **claimed name** before login authentication; someone claiming a listed name could trigger a wake. Minecraft still controls account authentication and final admission.
+
+### Prometheus
+
+```dotenv
+MC_METRICS_ENABLED=true
+MC_METRICS_LISTEN=127.0.0.1:9464
+MC_METRICS_POLL_INTERVAL=15s
+MC_METRICS_PLAYER_INTERVAL=60s
+MC_METRICS_PLAYER_DETAILS=true
+```
+
+Apply with `task config:reload -- .env`, inspect with `task metrics`, and point Prometheus at **`http://127.0.0.1:9464/metrics`**. The separate listener, enable flag and collection settings are live-reloadable. It is unauthenticated and defaults to loopback; expose it only to a trusted scraper or through an authenticated proxy. Player details include names/UUIDs, health, food, XP, position and game mode; disable them when unwanted.
+
+Scrapes use cached Minecraft/JVM samples and never wake the server. Availability and freshness metrics distinguish sleeping, unsupported and failed collection from healthy zero values. JVM collection reads same-account Linux process/HotSpot counters, with no JMX agent or Java startup changes. See [metric coverage and collection behavior](docs/metrics.md).
 
 ## Daily tasks
 
@@ -86,26 +126,23 @@ Run `task` to list everything. Commands run from the project/release directory.
 | Command | What it does |
 |---|---|
 | `task status` | State, players, connections, health and running version |
+| `task metrics` | Inspect cached Prometheus metrics through the private socket |
 | `task start` / `task stop` | Wake, or save/stop only when confirmed empty; later logins can wake it again |
 | `task command -- op PlayerName` | Send any console command through the private socket/RCON |
 | `task command -- 'tellraw @a {"text":"Hello!"}'` | Pass JSON or special characters literally |
 | `task logs:server` / `task logs:server:follow` | Read/follow Minecraft console output |
 | `task logs` / `task logs:follow` | Read/follow gateway events |
 | `task config:show` / `task config:live` | Desired/applied settings, password redacted |
-| `task config:edit` / `task config:check` / `task config:apply` | Edit, validate and live-reload `.env` |
+| `task config:edit` / `task config:check` | Edit or validate the single private `.env` |
+| `task config:reload -- .env` | Resolve and atomically apply `.env` through the socket; no restart |
 | `task gateway:stop` / `task gateway:start` | Disable/restore public access and wake monitoring; Minecraft stays running |
-| `task gateway:restart` | Load new gateway code/startup settings; disconnects clients, leaves Minecraft running |
-| `task deploy` / `task deploy:binary` | Validate/install a source build or packaged binary, then restart explicitly |
+| `task gateway:restart` | Load new gateway code/startup settings; send restart reason and disconnect clients; Java stays running |
+| `task deploy` / `task deploy:binary` | Validate/install code and gateway service settings, then restart explicitly |
+| `task gateway:configure` | Refresh gateway sandbox/drain settings without restarting either service |
 | `task config:init` | Restore the project symlink to an existing installation's `.env` |
 
 For a console-like setup, follow `task logs:server:follow` in one terminal and run `task command -- ...` in another. There is no tmux stdin to attach to. RCON commands are never automatically retried: if a reply is lost, check state before repeating a command with side effects.
 
 Both services run as `MC_SERVICE_USER`, never root. Operator tasks use `sudo -u` to access that user's mode-0600 socket. The daemon's sudo rule allows exactly **starting its backend unit**; it cannot run arbitrary root commands. RCON and the backend bind only to loopback.
 
-## Updates and releases
-
-For source updates: `git pull`, `task deploy`, then `task gateway:restart`. For a release archive, extract it separately, run `task config:init`, `task deploy:binary`, then `task gateway:restart`. Neither deployment command restarts Minecraft.
-
-`task check` runs formatting, vet, Go race tests and Python tests. `task release:package VERSION=v0.2.1` builds local packages; it does **not** tag or publish.
-
-GitHub releases run only for intentionally pushed SemVer tags such as `v0.2.1`. One bounded Linux job tests once, cross-compiles amd64/arm64, and publishes archives, checksums, build information and release notes/changelog. Ordinary branch pushes and pull requests spend **no Actions minutes** in this repository. Do not create a release tag for routine edits; [AGENTS.md](AGENTS.md) records the explicit owner-approval policy.
+For a source update, `git pull`, `task deploy`, then `task gateway:restart`. With a new release archive, extract separately, `task config:init`, `task deploy:binary`, then `task gateway:restart`. Deployment refreshes the gateway's read-only home access and bounded-shutdown support; it does not restart either process. `task check` runs validation/tests; `task release:package VERSION=v0.4.0` packages locally without tagging or publishing. Release **Changelog** entries are generated automatically from commit subjects/links since the previous stable tag; there is no maintained changelog file. The [release policy](AGENTS.md) keeps Actions tag-only and requires an intentional owner-approved release.
