@@ -12,6 +12,7 @@ one assignment. JSON ``\\n`` escapes are allowed only in player-facing messages.
 
 from collections.abc import Mapping
 import json
+import posixpath
 from pathlib import Path
 import re
 
@@ -58,6 +59,9 @@ CONFIG_KEYS = {
     "MC_METRICS_POLL_INTERVAL": "metrics_poll_interval",
     "MC_METRICS_PLAYER_INTERVAL": "metrics_player_interval",
     "MC_METRICS_PLAYER_DETAILS": "metrics_player_details",
+    "MC_METRICS_DIRECTORIES": "metrics_directories",
+    "MC_METRICS_DIRECTORY_INTERVAL": "metrics_directory_interval",
+    "MC_METRICS_DIRECTORY_TIMEOUT": "metrics_directory_timeout",
     "MC_LOG_LEVEL": "log_level",
 }
 
@@ -101,6 +105,9 @@ RUNTIME_DEFAULTS = {
     "MC_METRICS_POLL_INTERVAL": "15s",
     "MC_METRICS_PLAYER_INTERVAL": "60s",
     "MC_METRICS_PLAYER_DETAILS": True,
+    "MC_METRICS_DIRECTORIES": "{}",
+    "MC_METRICS_DIRECTORY_INTERVAL": "5m",
+    "MC_METRICS_DIRECTORY_TIMEOUT": "30s",
     "MC_LOG_LEVEL": "info",
 }
 
@@ -193,6 +200,8 @@ def _validate_value(key, value, line=None):
         _error("must be at most 4096 UTF-8 bytes", key, line)
     if key == "MC_LAUNCH_ARGS":
         launch_arguments(value, line=line)
+    if key == "MC_METRICS_DIRECTORIES":
+        metrics_directories(value, line=line)
     return value
 
 
@@ -216,6 +225,36 @@ def launch_arguments(value, *, line=None):
     if size > 32768:
         _error("arguments must total at most 32768 UTF-8 bytes", key, line)
     return arguments
+
+
+def metrics_directories(value, *, line=None):
+    """Decode bounded stable names to absolute paths, preserving literal values."""
+    key = "MC_METRICS_DIRECTORIES"
+    def unique_pairs(pairs):
+        result = {}
+        for name, path in pairs:
+            if name in result:
+                _error("must contain unique names", key, line)
+            result[name] = path
+        return result
+    try:
+        directories = json.loads(value, object_pairs_hook=unique_pairs)
+    except (json.JSONDecodeError, TypeError):
+        _error("must be a JSON object of named directory paths", key, line)
+    if not isinstance(directories, dict) or len(directories) > 32:
+        _error("must be a JSON object with at most 32 named directories", key, line)
+    for name, path in directories.items():
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", name):
+            _error("names must start with a letter and contain at most 64 ASCII letters, digits, dots, underscores or hyphens", key, line)
+        if not isinstance(path, str) or not posixpath.isabs(path) or posixpath.normpath(path).strip("/") == "" or any(char in path for char in "\x00\r\n"):
+            _error("values must be absolute non-root paths without NUL or line breaks", key, line)
+        try:
+            size = len(path.encode("utf-8"))
+        except UnicodeEncodeError:
+            _error("paths must contain valid Unicode", key, line)
+        if size > 4096:
+            _error("paths must be at most 4096 UTF-8 bytes", key, line)
+    return directories
 
 
 def validate_values(values):
@@ -307,7 +346,12 @@ def render_config(values, base_dict):
     result = dict(base_dict)
     for key, value in validate_values(values).items():
         if key in CONFIG_KEYS:
-            result[CONFIG_KEYS[key]] = launch_arguments(value) if key == "MC_LAUNCH_ARGS" else value
+            if key == "MC_LAUNCH_ARGS":
+                result[CONFIG_KEYS[key]] = launch_arguments(value)
+            elif key == "MC_METRICS_DIRECTORIES":
+                result[CONFIG_KEYS[key]] = metrics_directories(value)
+            else:
+                result[CONFIG_KEYS[key]] = value
     return result
 
 
@@ -324,7 +368,7 @@ def values_from_config(base_dict, *, include_manage_defaults=True):
         _error("base configuration contains an unsupported field")
     values = dict(MANAGE_DEFAULTS) if include_manage_defaults else {}
     values.update({reverse[field]: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-                   if field == "launch_args" else value for field, value in base_dict.items()})
+                   if field in ("launch_args", "metrics_directories") else value for field, value in base_dict.items()})
     return validate_values(values)
 
 

@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
-"""Task entry points. Treat .env and command arguments as data, never shell code.
+"""Embedded operator helpers. Treat .env and arguments as data, never shell code.
 
-The project .env is a symlink to the daemon's one private configuration file.
-Configuration reload and console commands go through the existing Unix socket.
-Binary deployment is atomic; gateway restart remains an explicit operation.
+The Go CLI supplies explicit paths and extracts these helpers privately.
+Configuration reload and console commands are handled natively by Go through
+the control socket. Binary deployment is atomic; restart remains explicit.
 """
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import shlex
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 
 from env_config import (
-    MANAGE_DEFAULTS, RUNTIME_DEFAULTS, MAX_ENV_BYTES, parse_env, read_env, redacted_values,
+    MANAGE_DEFAULTS, RUNTIME_DEFAULTS, MAX_ENV_BYTES, parse_env, redacted_values,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-ENV_FILE = ROOT / ".env"
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.service\Z")
 ACCOUNT_NAME = re.compile(r"[a-z_][a-z0-9_-]*\$?\Z")
 
@@ -33,30 +35,6 @@ ACCOUNT_NAME = re.compile(r"[a-z_][a-z0-9_-]*\$?\Z")
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
-
-
-def task_arguments(proc_root=Path("/proc"), parent_pid=None):
-    """Recover original CLI args before Task's recursive template expansion.
-
-    Task 3.44 templates both CLI_ARGS and CLI_ARGS_LIST, including literal
-    Minecraft text such as {{.FOO}}. On this Linux/systemd project the direct
-    parent is Task, so its original NUL-delimited argv is the reliable source.
-    If that contract changes, fail instead of sending guessed command text.
-    """
-    parent = proc_root / str(os.getppid() if parent_pid is None else parent_pid)
-    executable = Path(os.readlink(parent / "exe")).name.removesuffix(" (deleted)")
-    require(executable in ("task", "go-task"),
-            "cannot recover original arguments: invoke task <task-name> -- <arguments>")
-    with (parent / "cmdline").open("rb") as stream:
-        raw = stream.read(2 * 1024 * 1024 + 1)
-    require(len(raw) <= 2 * 1024 * 1024 and raw.endswith(b"\0"),
-            "invoking Task argument list is incomplete or too large")
-    argv = raw[:-1].split(b"\0")
-    try:
-        separator = argv.index(b"--")
-    except ValueError:
-        return []
-    return [os.fsdecode(item) for item in argv[separator + 1:]]
 
 
 def run(argv, *, capture=False):
@@ -67,13 +45,6 @@ def run(argv, *, capture=False):
         raise RuntimeError(f"command failed (exit {result.returncode})" +
                            (f": {detail[:2000]}" if detail else ""))
     return result.stdout if capture else ""
-
-
-def sudo(argv, *, capture=False, user=None):
-    prefix = ["sudo", "-n"]
-    if user:
-        prefix += ["-u", user]
-    return run(prefix + ["--"] + list(argv), capture=capture)
 
 
 def settings(values):
@@ -94,13 +65,6 @@ def settings(values):
     require(1 <= int(result["MC_LOG_LINES"]) <= 100000,
             "MC_LOG_LINES must be between 1 and 100000")
     return result
-
-
-def require_canonical_config(cfg):
-    """Fail clearly if an editor replaced the project symlink with a copy."""
-    require(ENV_FILE.resolve(strict=True) == Path(cfg["MC_CONFIG"]).resolve(strict=True),
-            "project .env is not the canonical MC_CONFIG file; move the duplicate aside "
-            "and restore the symlink with task config:init before applying settings")
 
 
 def atomic_write(path, data, *, mode, uid, gid):
@@ -142,6 +106,8 @@ def _replace_locked(source, destination, expected_hash, *, config):
             "installed file changed during validation; retry after reviewing the new file")
     data = source.read_bytes()
     require(data.startswith(b"\x7fELF"), "candidate is not an ELF executable")
+    if data == old:
+        return False
     require(config and Path(config).is_absolute(), "installed configuration path must be absolute")
     # Validate the exact executable bytes that will be installed, not a mutable
     # build output. The credential is read from .env, never passed in argv.
@@ -158,179 +124,205 @@ def _replace_locked(source, destination, expected_hash, *, config):
     atomic_write(destination.with_name(destination.name + ".previous"), old,
                  mode=mode, uid=info.st_uid, gid=info.st_gid)
     atomic_write(destination, data, mode=mode, uid=info.st_uid, gid=info.st_gid)
+    return True
 
 
-def initialize():
-    canonical = Path(MANAGE_DEFAULTS["MC_CONFIG"])
-    require(canonical.is_file(), "canonical .env is missing; complete task install first")
-    if ENV_FILE.is_symlink() and ENV_FILE.resolve() == canonical.resolve():
-        print("Project .env already points to the canonical configuration.")
-        return
-    require(not os.path.lexists(ENV_FILE),
-            ".env already exists; refusing to overwrite it or create another configuration copy")
-    ENV_FILE.symlink_to(canonical)
-    print("Linked project .env to the canonical configuration; no settings were copied.")
+def private_env(path):
+    """Read one explicit source, including a canonical-file symlink."""
+    resolved = path.resolve(strict=True)
+    descriptor = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) in (0o600, 0o640),
+                ".env must be a regular private file with 0600 or 0640 permissions")
+        raw = stream.read(MAX_ENV_BYTES + 1)
+    return resolved, parse_env(raw)
 
 
-def new_configuration():
-    """Create the first private .env without echoing or exporting credentials."""
-    require(not os.path.lexists(ENV_FILE), ".env already exists; use task config:edit")
-    example = (ROOT / ".env.example").read_text()
-    placeholder = "replace-with-a-random-private-password"
-    require(example.count(placeholder) == 1, ".env.example credential marker changed; review the example")
-    data = example.replace(placeholder, secrets.token_urlsafe(32))
-    descriptor = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "w") as stream:
-        stream.write(data)
-    print("Created private .env with a random RCON password. Run task config:edit to set your server paths and account.")
+def embedded_canonical(env_path):
+    path, values = private_env(env_path)
+    cfg = settings(values)
+    require(path == Path(cfg["MC_CONFIG"]).resolve(strict=True),
+            "this command requires the canonical installed MC_CONFIG file; select it with --env")
+    return path, values, cfg
 
 
-def preflight_gateway_restart(cfg):
-    """Keep the working daemon alive if the candidate cannot safely adopt Java."""
-    state = sudo(["systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
-                  "--property=ActiveState", "--value"], capture=True).strip()
-    command = [cfg["MC_BINARY"]]
-    if state in ("active", "activating", "reloading"):
-        command += ["restart-check", "--socket", cfg["MC_ADMIN_SOCKET"],
-                    "--config", cfg["MC_CONFIG"]]
-    else:
-        require(state in ("inactive", "failed"),
-                "gateway state is stopping or unknown; wait for it to settle before restarting")
-        # There is no running socket to consult. The daemon also verifies its
-        # credential before adopting a running Minecraft process at startup.
-        command += ["check", "--config", cfg["MC_CONFIG"]]
-    sudo(command, capture=True, user=cfg["MC_SERVICE_USER"])
+def embedded_system(argv, *, user=None):
+    require(os.geteuid() == 0, "this operator command requires root; run it with sudo")
+    if user:
+        argv = ["/usr/sbin/runuser", "-u", user, "--"] + list(argv)
+    return run(argv, capture=True)
 
 
-def operate(action, arguments):
-    if action == "config-new":
-        require(not arguments, "config:new takes no arguments")
-        new_configuration()
-        return
-    if action == "config-init":
-        require(not arguments, "config:init takes no arguments")
-        initialize()
-        return
+def embedded_operate(action, arguments, env_path, executable):
+    """Source-independent dispatcher called by the binary's isolated helper."""
+    env_path, executable = Path(env_path).absolute(), Path(executable).absolute()
+    result = {"ok": True, "action": action}
+    if action in ("init", "config-new"):
+        require(not arguments, "init accepts one output path through --env")
+        require(not os.path.lexists(env_path), ".env already exists; use config edit")
+        require(env_path.parent.is_dir(), "configuration parent directory does not exist")
+        example = (ROOT / ".env.example").read_text()
+        placeholder = "replace-with-a-random-private-password"
+        require(example.count(placeholder) == 1, "embedded credential marker is invalid")
+        data = example.replace(placeholder, secrets.token_urlsafe(32))
+        descriptor = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        result.update(path=str(env_path), message="Created private .env with a random RCON password. Configure your Minecraft paths and service account before installation.")
+        return result
+
+    if action == "config-link":
+        require(not arguments, "config link takes no extra arguments")
+        canonical = Path(MANAGE_DEFAULTS["MC_CONFIG"])
+        require(canonical.is_file(), "installed canonical .env is missing")
+        if env_path.is_symlink() and env_path.resolve() == canonical.resolve():
+            result.update(path=str(env_path), changed=False, message="Configuration link is already correct.")
+            return result
+        require(not os.path.lexists(env_path), "refusing to overwrite an existing configuration file or link")
+        env_path.symlink_to(canonical)
+        result.update(path=str(env_path), changed=True, message="Linked the installed canonical .env; no configuration was copied.")
+        return result
+
     if action == "config-edit":
-        require(not arguments, "config:edit takes no arguments")
-        require(ENV_FILE.exists(), "run task config:init first")
+        require(not arguments, "config edit takes no extra arguments")
+        source = env_path.resolve(strict=True)
+        require(source.is_file(), "configuration must be a regular file")
         editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano")
         require(editor, "EDITOR is empty")
-        # Give editors the real filename: their atomic saves must replace the
-        # canonical file rather than silently replace the project symlink.
-        # Its parent has the service group and setgid bit, so replacement files
-        # retain service-account access without opening the operator's home directory.
+        # Terminal output stays on the terminal, preserving the CLI's JSON
+        # stdout contract. Resolve links before editors perform atomic saves.
         os.umask(0o027)
-        os.execvp(editor[0], editor + [str(ENV_FILE.resolve(strict=True))])
-    require(ENV_FILE.exists(), "missing .env; run task config:init first")
-    reloading = action in ("config-reload", "config-apply", "reload")
-    if reloading:
-        require(len(arguments) <= 1, "config:reload accepts at most one .env path")
-        source = Path(arguments[0]).resolve(strict=True) if arguments else ENV_FILE.resolve(strict=True)
-        require(source == ENV_FILE.resolve(strict=True),
-                "reload path must resolve to the installed canonical .env; use task config:init to restore its link")
-        with source.open("rb") as stream:
-            snapshot = stream.read(MAX_ENV_BYTES + 1)
-        values = parse_env(snapshot)
-        digest = hashlib.sha256(snapshot).hexdigest()
-    else:
-        values = read_env(ENV_FILE)
-    cfg = settings(values)
-    require_canonical_config(cfg)
-    command_prefix = [cfg["MC_BINARY"]]
+        try:
+            with open("/dev/tty", "r+b", buffering=0) as terminal:
+                edited = subprocess.Popen(editor + [str(source)], stdin=terminal,
+                                          stdout=terminal, stderr=terminal)
+                try:
+                    returncode = edited.wait()
+                except BaseException:
+                    # In an interactive foreground group only Python receives
+                    # the CLI's explicit cancel signal. Close its editor too.
+                    edited.terminate()
+                    try:
+                        edited.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        edited.kill()
+                        edited.wait()
+                    raise
+        except OSError as error:
+            raise RuntimeError("config edit needs an interactive terminal and an installed EDITOR") from error
+        require(returncode == 0, "editor exited unsuccessfully")
+        result.update(path=str(source), message="Configuration edited. Use config check, then config reload to apply supported settings.")
+        return result
 
-    if action in ("config-show", "config-check") or reloading:
-        require(reloading or not arguments, "this configuration task takes no arguments")
-        if action == "config-show":
-            print(json.dumps(redacted_values(values), indent=2, ensure_ascii=False))
-            print("These are .env settings with defaults; task config:reload -- .env applies supported changes live.")
-            return
-        if action == "config-check":
-            sudo(command_prefix + ["check", "--config", cfg["MC_CONFIG"]],
-                 capture=True, user=cfg["MC_SERVICE_USER"])
-            print(".env is valid and readable by the service account. No files or services changed.")
-            return
-        sudo(command_prefix + ["reload", "--socket", cfg["MC_ADMIN_SOCKET"],
-                               "--env", str(source), "--expected-sha256", digest],
-             user=cfg["MC_SERVICE_USER"])
-        print("Configuration reload completed through the control socket. No service restart was requested.")
-        return
+    if action == "config-show":
+        require(not arguments, "config show takes no extra arguments")
+        source, values = private_env(env_path)
+        result.update(path=str(source), settings=redacted_values(values))
+        return result
 
+    if action in ("install", "backup"):
+        import install
+        require(os.geteuid() == 0, "installation and backup require root")
+        if action == "backup":
+            require(not arguments, "backup takes no extra arguments; set MC_BACKUP_DIRECTORY in .env")
+            with contextlib.redirect_stdout(io.StringIO()):
+                data = install.create_backup(env_path)
+            result.update(data)
+            result["message"] = "Full Minecraft server backup created and verified."
+            return result
+        parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+        parser.add_argument("--report", type=Path, default=env_path.parent / ".mcs-bootloader-installation.json")
+        parsed, unknown = parser.parse_known_args(arguments)
+        require(not unknown, "install supports only --report PATH")
+        with contextlib.redirect_stdout(io.StringIO()):
+            data = install.install(env_path, parsed.report.absolute(), binary_path=executable)
+        result.update(data)
+        result["message"] = "Gateway installed and enabled; Minecraft starts when a player connects or you run start."
+        return result
+
+    if action == "remove":
+        import remove
+        require(arguments in ([], ["--dry-run"], ["--yes"]), "remove accepts --dry-run or --yes")
+        return remove.remove(env_path, yes=arguments == ["--yes"])
+
+    require(not arguments, "this operator command takes no extra arguments")
+    canonical, values, cfg = embedded_canonical(env_path)
+    require(os.geteuid() == 0, "this operator command requires root")
     if action == "deploy":
-        require(not arguments, "deploy takes no arguments")
-        source = ROOT / "bin/mcs-bootloader"
-        require(source.is_file(), "build the binary with task build first")
-        sudo([str(source), "check", "--config", cfg["MC_CONFIG"]], capture=True)
-        old_hash = sudo(["sha256sum", "--", cfg["MC_BINARY"]], capture=True).split()[0]
-        sudo([sys.executable, str(Path(__file__).resolve()), "_deploy", str(source),
-              cfg["MC_BINARY"], old_hash, cfg["MC_CONFIG"]])
-        print("Installed the new executable atomically. Operator commands use it immediately.")
-        print("The running gateway keeps its current executable until task gateway:restart.")
-        print("Gateway and Minecraft processes were left running.")
-        return
-
+        require(executable.is_file(), "the running executable is unavailable")
+        destination = Path(cfg["MC_BINARY"])
+        # Destination and parents are validated before the privileged replace.
+        import service_config
+        service_config.secure_directory(destination.parent)
+        installed, _ = service_config.read_regular(destination, owned=True, limit=128 * 1024 * 1024)
+        # Reject pending/foreign unit edits before copying a candidate binary.
+        service_config.preflight(canonical)
+        if executable.read_bytes() == installed:
+            configured = service_config.configure(canonical)
+            result.update(changed=False, service_changed=configured, binary=str(destination),
+                          message="This executable is already installed; service settings were checked and the previous rollback binary was preserved.")
+            return result
+        replace_installed(executable, destination, hashlib.sha256(installed).hexdigest(), config=str(canonical))
+        try:
+            configured = service_config.configure(canonical)
+        except Exception as error:
+            raise RuntimeError("Executable installed, but service settings could not be refreshed; "
+                               "the running gateway and Minecraft were not restarted. "
+                               f"Previous executable: {destination}.previous. Review gateway configure before restarting: {error}") from error
+        result.update(changed=True, service_changed=configured, binary=str(destination), previous=str(destination) + ".previous",
+                      message="Executable installed atomically and service settings refreshed. Run gateway restart to use it; Minecraft stays running.")
+        return result
     if action == "gateway-configure":
-        require(not arguments, "gateway:configure takes no arguments")
-        sudo([sys.executable, str(ROOT / "scripts/service_config.py"),
-              "--env", cfg["MC_CONFIG"]])
-        return
-
-    if action.startswith("logs"):
-        server = "server" in action
-        follow = action.endswith("follow")
-        unit = cfg["MC_BACKEND_SERVICE"] if server else cfg["MC_GATEWAY_SERVICE"]
-        argv = ["sudo", "-n", "--", "journalctl", "--namespace=" + cfg["MC_LOG_NAMESPACE"],
-                "-u", unit, "-n", str(cfg["MC_LOG_LINES"]), "-o", "cat"]
-        argv += ["-f"] if follow else ["--no-pager"]
-        os.execvp(argv[0], argv + arguments)
-
-    if action in ("status", "metrics", "config-live", "start", "stop", "command", "version"):
-        if action == "command":
-            argv = command_prefix + ["command", "--socket", cfg["MC_ADMIN_SOCKET"],
-                                     "--timeout", str(cfg["MC_COMMAND_TIMEOUT"]), "--"] + arguments
-        else:
-            require(not arguments, f"{action} takes no arguments")
-            operation = {"start": "wake", "stop": "sleep", "config-live": "config"}.get(action, action)
-            argv = command_prefix + [operation]
-            if operation != "version":
-                argv += ["--socket", cfg["MC_ADMIN_SOCKET"]]
-        # Tasks run as the service user, not as root; RCON stays local/private.
-        full = ["sudo", "-n", "-u", cfg["MC_SERVICE_USER"], "--"] + argv
-        os.execvp(full[0], full)
-
+        import service_config
+        changed = service_config.configure(canonical)
+        result.update(changed=changed, message="Gateway service settings configured; no service was restarted." if changed else "Gateway service settings are already configured.")
+        return result
     if action in ("gateway-start", "gateway-stop", "gateway-restart"):
-        require(not arguments, f"{action} takes no arguments")
         verb = action.removeprefix("gateway-")
-        if verb == "restart":
-            preflight_gateway_restart(cfg)
-        if verb in ("stop", "restart"):
-            print(f"Explicit gateway {verb}: connected clients disconnect; Java stays running.", flush=True)
-        sudo(["systemctl", verb, cfg["MC_GATEWAY_SERVICE"]])
-        return
-    raise RuntimeError("unknown management action")
+        if verb in ("start", "restart"):
+            state = embedded_system(["/usr/bin/systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
+                                     "--property=ActiveState", "--value"]).strip()
+            if state in ("active", "activating", "reloading"):
+                check = [cfg["MC_BINARY"], "restart-check", "--socket", cfg["MC_ADMIN_SOCKET"],
+                         "--config", str(canonical)]
+            else:
+                require(state in ("inactive", "failed"), "gateway is stopping or its state is unknown; wait before starting it")
+                check = [cfg["MC_BINARY"], "check", "--config", str(canonical)]
+            embedded_system(check, user=cfg["MC_SERVICE_USER"])
+        embedded_system(["/usr/bin/systemctl", verb, cfg["MC_GATEWAY_SERVICE"]])
+        result.update(service=cfg["MC_GATEWAY_SERVICE"],
+                      message=f"Gateway {verb} completed. Minecraft was left running if it was already up.")
+        return result
+    raise RuntimeError("unknown embedded operator action")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def embedded_main():
+    parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    parser.add_argument("--embedded", action="store_true")
+    parser.add_argument("--env", required=True)
+    parser.add_argument("--executable", required=True)
     parser.add_argument("action")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
-    arguments = args.arguments
-    if arguments[:1] == ["--"]:
-        arguments = arguments[1:]
-    if args.action in ("command", "config-reload", "config-apply", "reload") and arguments == ["--task-args"]:
-        arguments = task_arguments()
-    if args.action == "_deploy":
-        require(len(arguments) == 4, "invalid install arguments")
-        source, destination, digest = arguments[:3]
-        replace_installed(Path(source), Path(destination), digest, config=arguments[3])
-        return
-    operate(args.action, arguments)
+
+    def interrupted(signum, frame):
+        # Allow install's exception handler to restore transaction state.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        raise RuntimeError("operator command interrupted")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        args = parser.parse_args()
+        result = embedded_operate(args.action, args.arguments, Path(args.env), Path(args.executable))
+        print(json.dumps(result, ensure_ascii=False))
+    except Exception as error:
+        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except (OSError, ValueError, RuntimeError) as error:
-        print(f"mcs-bootloader tasks: {error}", file=sys.stderr)
-        sys.exit(1)
+    embedded_main()

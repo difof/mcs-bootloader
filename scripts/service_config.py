@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Apply the owned gateway runtime drop-in without restarting either service."""
 
-import argparse
 import contextlib
 import fcntl
 import json
@@ -9,7 +8,6 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-import sys
 import tempfile
 
 from env_config import MAX_ENV_BYTES, parse_env
@@ -127,7 +125,7 @@ def inspect_service(cfg):
         expected = [cfg["MC_BINARY"], "serve", "--config", cfg["MC_CONFIG"]]
         require(reply.get("type") == "a(sasbttttuii)" and isinstance(commands, list)
                 and len(commands) == 1 and isinstance(commands[0], list) and len(commands[0]) == 10
-                and commands[0][0] == cfg["MC_BINARY"] and commands[0][1] == expected,
+                and commands[0][0] == cfg["MC_BINARY"] and commands[0][1] in (expected, expected + ["--json"]),
                 "configured unit does not execute the installed mcs-bootloader with its canonical .env")
     except (ValueError, TypeError, AttributeError, KeyError) as error:
         raise RuntimeError("systemd returned an invalid gateway execution description") from error
@@ -161,7 +159,8 @@ def configured(properties):
     return properties["ProtectHome"] == "read-only" and properties["TimeoutStopUSec"] == "infinity"
 
 
-def configure(env_path, *, systemd_directory=SYSTEMD_DIRECTORY):
+def preflight(env_path, *, systemd_directory=SYSTEMD_DIRECTORY):
+    """Validate known ownership/topology conflicts without changing a file."""
     require(os.geteuid() == 0, "gateway service configuration requires sudo")
     env_path = Path(env_path)
     require(env_path.is_absolute(), "--env must name the absolute canonical .env")
@@ -171,8 +170,22 @@ def configure(env_path, *, systemd_directory=SYSTEMD_DIRECTORY):
             "--env must name the canonical MC_CONFIG file")
     before = inspect_service(cfg)
     require(before["NeedDaemonReload"] == "no",
-            "unit definitions already have unapplied edits; review and reload those before gateway:configure")
+            "unit definitions already have unapplied edits; review and reload those before gateway configure")
     secure_directory(systemd_directory)
+    directory = systemd_directory / (cfg["MC_GATEWAY_SERVICE"] + ".d")
+    if os.path.lexists(directory):
+        secure_directory(directory)
+        try:
+            previous, _ = read_regular(directory / DROP_IN_NAME, owned=True)
+        except FileNotFoundError:
+            previous = None
+        require(previous is None or previous == DROP_IN,
+                "the fixed gateway drop-in already exists with unknown content; it was not overwritten")
+    return cfg, before
+
+
+def configure(env_path, *, systemd_directory=SYSTEMD_DIRECTORY):
+    cfg, before = preflight(env_path, systemd_directory=systemd_directory)
     directory = systemd_directory / (cfg["MC_GATEWAY_SERVICE"] + ".d")
     created_directory = False
     try:
@@ -246,20 +259,3 @@ def configure(env_path, *, systemd_directory=SYSTEMD_DIRECTORY):
                 directory.rmdir()  # only removes the new directory after a failed, fully rolled-back write
             except OSError:
                 pass
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", required=True, type=Path)
-    args = parser.parse_args()
-    changed = configure(args.env)
-    print("Gateway service settings configured; neither service was restarted." if changed
-          else "Gateway service settings are already configured; no changes made.")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (OSError, ValueError, RuntimeError) as error:
-        print(f"mcs-bootloader gateway configuration: {error}", file=sys.stderr)
-        sys.exit(1)

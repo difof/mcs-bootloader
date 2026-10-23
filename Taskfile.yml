@@ -10,11 +10,11 @@ tasks:
   fmt:
     desc: Format Go source
     cmds:
-      - gofmt -w cmd internal
+      - gofmt -w assets*.go cmd internal
   fmt:check:
     desc: Check formatting without changing files
     cmds:
-      - 'test -z "$(gofmt -l cmd internal)"'
+      - 'test -z "$(gofmt -l assets*.go cmd internal)"'
   vet:
     desc: Run Go static analysis
     cmds:
@@ -31,7 +31,7 @@ tasks:
       - task: test
       - python3 -m unittest discover -s scripts -p 'test_*.py'
   build:
-    desc: Build the daemon and local admin/command client
+    desc: Build the standalone daemon and operator CLI
     cmds:
       - mkdir -p bin
       - go build -trimpath -ldflags {{printf "-s -w -X main.version=%s" .VERSION | shellQuote}} -o bin/mcs-bootloader ./cmd/mcs-bootloader
@@ -40,151 +40,257 @@ tasks:
     cmds:
       - go test ./internal/mcproto -run '^$' -fuzz '^FuzzReadHandshake$' -fuzztime=10s -parallel=2
   install:
-    desc: Check and build source, then install against a stopped and backed-up server
+    desc: Check/build, then install against a stopped and backed-up server
     cmds:
       - task: check
       - task: build
       - task: install:binary
-  install:binary:
-    desc: Install the bundled binary; verify a stopped server and backup (no Go needed)
-    cmds:
-      - mkdir -p .local
-      - sudo -n python3 scripts/install.py --env .env
-      - task: config:init
-  backup:
-    desc: Create and verify a complete first-install backup while Minecraft is stopped
-    cmds:
-      - mkdir -p .local
-      - sudo -n python3 scripts/install.py --env .env --backup
   deploy:
-    desc: Check, build, and install an update; leave running gateway and Java untouched
+    desc: Check/build, then atomically install an update; restart explicitly
     cmds:
       - task: check
       - task: build
       - task: deploy:binary
-  deploy:binary:
-    desc: Install a bundled update and gateway service settings without restarting either service
-    cmds:
-      - python3 scripts/manage.py deploy
-      - task: gateway:configure
   release:package:
-    desc: 'Check and package both Linux architectures locally: task release:package VERSION=v0.4.0 (never tags or publishes)'
+    desc: 'Check/build standalone release binaries locally: task release:package VERSION=v0.5.0 (never publishes)'
     preconditions:
       - sh: python3 scripts/release.py check-version --version {{.VERSION | shellQuote}}
-        msg: Supply a stable semantic version such as VERSION=v0.4.0
+        msg: Supply a stable semantic version such as VERSION=v0.5.0
     cmds:
       - task: check
       - python3 scripts/release.py package --version {{.VERSION | shellQuote}}
+  cli:
+    desc: 'Run any binary command: task cli -- config show --json'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task
+  install:binary:
+    desc: 'Install using the built executable and its embedded assets'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task install
+  backup:
+    desc: 'Create and verify a complete first-install backup while Minecraft is stopped'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task backup
+  deploy:binary:
+    desc: 'Atomically deploy the built executable; leave running processes untouched'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task deploy
+  remove:
+    desc: 'Preview removal; pass -- --yes to remove owned service files, retaining server and config'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task remove
   status:
-    desc: Show Minecraft state, player health, connections, and gateway version
+    desc: 'Show state, players, connections and version'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py status {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task status
+  stats:
+    desc: 'Show cached telemetry as a readable summary'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task stats
   version:
-    desc: Show the installed executable version (running daemon version is in status)
+    desc: 'Show the built executable version; status shows the running daemon version'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py version {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task version
   metrics:
-    desc: Show the enabled exporter's cached Prometheus metrics through the private socket
+    desc: 'Inspect cached metrics; use -- --raw for Prometheus or -- --json'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py metrics {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task metrics
   start:
     aliases: [wake]
-    desc: Start Minecraft once; joining also wakes it automatically
+    desc: 'Wake Minecraft once; joining also wakes it automatically'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py start {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task start
   stop:
     aliases: [sleep]
-    desc: Save and stop when empty; refuses active players/joins; future login wakes it
+    desc: 'Save and stop only when empty; refuse active players or joins'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py stop {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task stop
   command:
-    desc: 'Send a console command through the private socket: task command -- op PlayerName'
+    desc: 'Send a console command: task command -- op PlayerName'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py command --task-args
+      - ./bin/mcs-bootloader _task command
   logs:
-    desc: Show recent gateway state and connection events
+    desc: 'Show recent gateway events'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py logs {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task logs
   logs:follow:
-    desc: Follow gateway events (Ctrl+C exits the viewer)
+    desc: 'Follow gateway events; Ctrl+C exits the viewer'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py logs-follow {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task logs --follow
   logs:server:
-    desc: Show recent Minecraft console output
+    desc: 'Show recent Minecraft console output'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py logs-server {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task logs --server
   logs:server:follow:
-    desc: Follow Minecraft console output (Ctrl+C exits the viewer)
+    desc: 'Follow Minecraft console output'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py logs-server-follow {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task logs --server --follow
   config:new:
-    desc: Create a private .env example with a random RCON password; never overwrite
+    desc: 'Create a private .env with a random RCON password; never overwrite'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-new
+      - ./bin/mcs-bootloader _task config new
+  init:
+    desc: 'Create the initial private configuration from embedded defaults'
+    silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
+    cmds:
+      - ./bin/mcs-bootloader _task init
   config:init:
-    desc: Link project .env to the installed canonical file without copying secrets
+    desc: 'Link local .env to the installed canonical configuration'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-init {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task config link
   config:edit:
-    desc: Edit the canonical .env using VISUAL, EDITOR, or nano
+    desc: 'Edit the canonical .env using VISUAL, EDITOR or nano'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-edit {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task config edit
   config:show:
-    desc: Show .env settings and defaults with the password redacted
+    desc: 'Show desired settings with the password redacted'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-show {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task config show
   config:live:
-    desc: Show the daemon's applied settings and generation with the password redacted
+    desc: 'Show applied settings with the password redacted'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-live {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task config live
   config:check:
-    desc: Validate canonical .env and service-account access without changing files or services
+    desc: 'Validate settings and service-account access'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-check {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task config check
   config:reload:
     aliases: [reload]
-    desc: 'Re-read the canonical .env through the socket: task config:reload -- .env'
+    desc: 'Atomically re-read .env over the socket: task config:reload -- .env'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-reload --task-args
+      - ./bin/mcs-bootloader _task config reload
   config:apply:
-    desc: Compatibility alias for config:reload; accepts the same optional .env path
+    desc: 'Compatibility alias for config:reload'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py config-reload --task-args
+      - ./bin/mcs-bootloader _task config reload
   gateway:start:
-    desc: Start the gateway service (does not directly start Minecraft)
+    desc: 'Start the gateway and wake monitoring'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py gateway-start {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task gateway start
   gateway:configure:
-    desc: Refresh gateway sandbox/drain settings; no process restart or Minecraft changes
+    desc: 'Refresh gateway service settings without restarting processes'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py gateway-configure {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task gateway configure
   gateway:stop:
-    desc: Stop gateway and disconnect clients; leave Java running; disables wake until started
+    desc: 'Stop public access and wake monitoring; Java stays running'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py gateway-stop {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task gateway stop
   gateway:restart:
-    desc: Restart gateway after a code update; disconnect clients; leave Java running
+    desc: 'Restart the gateway after preflight; disconnect clients, keep Java running'
     silent: true
+    preconditions:
+      - sh: test -x ./bin/mcs-bootloader
+        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - python3 scripts/manage.py gateway-restart {{.CLI_ARGS}}
+      - ./bin/mcs-bootloader _task gateway restart

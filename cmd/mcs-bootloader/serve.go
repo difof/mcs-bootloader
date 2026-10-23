@@ -24,6 +24,10 @@ import (
 )
 
 func serve(configPath string) error {
+	return serveWithOutput(configPath, newCLIOutput(os.Stdout, os.Stderr))
+}
+
+func serveWithOutput(configPath string, output *cliOutput) error {
 	configPath, err := filepath.Abs(configPath)
 	if err != nil {
 		return err
@@ -39,7 +43,13 @@ func serve(configPath string) error {
 	}
 	level := new(slog.LevelVar)
 	level.Set(parseLogLevel(cfg.LogLevel))
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	var logOutput io.Writer = output.Out
+	// Keep journal records structured even for existing installations whose unit
+	// predates the explicit --json flag; foreground runs use human formatting.
+	if !output.JSON && os.Getenv("INVOCATION_ID") == "" {
+		logOutput = logWriter{output: output}
+	}
+	log := slog.New(slog.NewJSONHandler(logOutput, &slog.HandlerOptions{Level: level}))
 	password := cfg.RCONPassword
 	if err := os.MkdirAll(cfg.StateDirectory, 0700); err != nil {
 		return err

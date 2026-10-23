@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Build release bundles locally. This script never tags, pushes, or publishes."""
+"""Build standalone release executables. Never tag, push, or publish."""
 
 import argparse
-import gzip
 import hashlib
 import html
-import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -13,7 +11,6 @@ import re
 import struct
 import subprocess
 import sys
-import tarfile
 import tempfile
 
 
@@ -22,7 +19,7 @@ VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 ARCHITECTURES = {"amd64": 62, "arm64": 183}
 ROOT_FILES = frozenset({
     "README.md", "AGENTS.md", "Taskfile.yml", ".env.example",
-    ".gitignore", "go.mod", "go.sum", "LICENSE", "LICENSE.md",
+    ".gitignore", "go.mod", "go.sum", "LICENSE", "LICENSE.md", "assets.go", "assets_test.go",
 })
 SOURCE_SUFFIXES = {
     "cmd": {".go"}, "internal": {".go"}, "scripts": {".py"},
@@ -30,8 +27,8 @@ SOURCE_SUFFIXES = {
     ".github": {".yml", ".yaml"},
 }
 REQUIRED_FILES = frozenset({
-    "README.md", "AGENTS.md", "Taskfile.yml", ".env.example", "go.mod",
-    "scripts/install.py", "scripts/manage.py", "scripts/env_config.py", "scripts/service_config.py",
+    "README.md", "AGENTS.md", "Taskfile.yml", ".env.example", "go.mod", "assets.go",
+    "scripts/install.py", "scripts/manage.py", "scripts/env_config.py", "scripts/service_config.py", "scripts/remove.py",
     "deploy/mcs-bootloader.service", "deploy/mcs-bootloader-backend.service",
     "deploy/journald@mcs-bootloader.conf",
 })
@@ -55,7 +52,7 @@ def package_files(root, tracked):
         path = PurePosixPath(name)
         if path.is_absolute() or ".." in path.parts or not path.parts:
             raise ValueError("Git contains an unsafe package path")
-        if any(part in {".env", ".local", ".git", "world", "mods", "__pycache__"}
+        if any(part in {".env", ".local", ".git", ".mcs-bootloader-installation.json", "world", "mods", "__pycache__"}
                for part in path.parts) or path.suffix in {".password", ".log"}:
             raise ValueError("private/server data must not be tracked in the release source")
         if name not in ROOT_FILES and path.suffix not in SOURCE_SUFFIXES.get(path.parts[0], set()):
@@ -112,37 +109,17 @@ def validate_binary(path, architecture):
         raise ValueError("build did not produce the expected 64-bit Linux executable")
 
 
-def write_archive(destination, prefix, files, epoch):
-    """Normalize timestamps/owners/modes; private host metadata stays out."""
-    with destination.open("wb") as stream:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=stream, mtime=epoch, compresslevel=6) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
-                for name, data, executable in sorted(files):
-                    info = tarfile.TarInfo(f"{prefix}/{name}")
-                    info.size = len(data)
-                    info.mtime = epoch
-                    info.mode = 0o755 if executable else 0o644
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = "root"
-                    archive.addfile(info, io.BytesIO(data))
-
-
 def release_notes(version, commits, metadata, repository, previous=None):
     base = f"https://github.com/{repository}"
     changelog = "\n".join(f"- {markdown_subject(subject)} ([{commit[:12]}]({base}/commit/{commit}))"
                           for commit, subject in commits)
     comparison = (f"[Full diff]({base}/compare/{previous}...{version})" if previous else
                   f"[Full history]({base}/commits/{version})")
-    source_range = f"`{previous}..{version}`" if previous else f"the complete history through `{version}`"
     return f"""## Changelog
 
 {changelog}
 
 {comparison}
-
-Generated automatically from Git commit subjects and links in {source_range}.
-The base is the highest earlier stable version tag reachable from the release
-commit. There is no manually maintained changelog file.
 
 ## Build details
 
@@ -150,8 +127,8 @@ commit. There is no manually maintained changelog file.
 - Source: [{metadata['commit'][:12]}]({base}/commit/{metadata['commit']})
 - Toolchain: `{metadata['go_toolchain']}`
 - Targets: Linux amd64 and arm64, `CGO_ENABLED=0`
-- Automated tests run on amd64; the arm64 binary is cross-compiled.
-- Included metadata: `build-info.json`; SHA-256 hashes cover both bundles and metadata.
+- Standalone executables with embedded operator scripts and service templates
+- Included metadata: `build-info.json`; SHA-256 hashes cover both binaries and metadata.
 
 """
 
@@ -161,13 +138,16 @@ def package(version, root=ROOT):
     if run(["git", "status", "--porcelain", "--untracked-files=all"], root=root):
         raise ValueError("commit or stash source edits before packaging; private .env and dist/ stay ignored")
     tracked = run(["git", "ls-files", "-z"], root=root).split("\0")
-    files = package_files(root, [name for name in tracked if name])
+    # Validate the tracked tree before compiling: embedded assets must never
+    # accidentally include private configuration or server data.
+    package_files(root, [name for name in tracked if name])
     commit = run(["git", "rev-parse", "HEAD"], root=root)
     epoch = int(run(["git", "show", "-s", "--format=%ct", "HEAD"], root=root))
     metadata = {
         "project": "mcs-bootloader", "version": version, "commit": commit,
         "commit_timestamp": epoch, "go_toolchain": run(["go", "version"], root=root),
         "targets": ["linux/amd64", "linux/arm64"], "cgo_enabled": False,
+        "distribution": "standalone-binary", "operator_assets": "embedded",
     }
     repository = os.environ.get("GITHUB_REPOSITORY", "difof/mcs-bootloader")
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
@@ -175,8 +155,6 @@ def package(version, root=ROOT):
     previous, commits = git_changelog(version, root)
     metadata["changelog_base"] = previous
     encoded_metadata = (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
-    source = [(name, (root / name).read_bytes(), False) for name in files]
-    source.append(("build-info.json", encoded_metadata, False))
     destination = root / "dist" / version
     if destination.exists() or destination.is_symlink():
         raise ValueError("this version already has local packages in dist/; inspect or move them before rebuilding")
@@ -187,16 +165,15 @@ def package(version, root=ROOT):
         output.mkdir()
         assets = []
         for architecture in ARCHITECTURES:
-            binary = staged / f"mcs-bootloader-{architecture}"
+            binary = output / f"mcs-bootloader_{version}_linux_{architecture}"
             run(["go", "build", "-trimpath", "-buildvcs=false", "-ldflags",
                  f"-s -w -X main.version={version}", "-o", str(binary), "./cmd/mcs-bootloader"],
                 root=root, env={**os.environ, "CGO_ENABLED": "0", "GOOS": "linux",
                                 "GOARCH": architecture, "GOFLAGS": "", "GOTOOLCHAIN": "local"})
             validate_binary(binary, architecture)
-            name = f"mcs-bootloader_{version}_linux_{architecture}"
-            archive = output / f"{name}.tar.gz"
-            write_archive(archive, name, source + [("bin/mcs-bootloader", binary.read_bytes(), True)], epoch)
-            assets.append(archive)
+            binary.chmod(0o755)
+            os.utime(binary, (epoch, epoch))
+            assets.append(binary)
         info = output / "build-info.json"
         info.write_bytes(encoded_metadata)
         assets.append(info)
@@ -205,7 +182,7 @@ def package(version, root=ROOT):
         (output / "SHA256SUMS").write_text(checksums)
         (output / "RELEASE_NOTES.md").write_text(release_notes(version, commits, metadata, repository, previous))
         output.rename(destination)
-    print(f"Packages ready in {destination}; no tag, push, or release was created.")
+    print(f"Standalone binaries ready in {destination}; no tag, push, or release was created.")
 
 
 def main():

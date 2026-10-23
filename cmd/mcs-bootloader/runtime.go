@@ -132,7 +132,8 @@ func metricsConfig(cfg backend.Config) telemetry.Config {
 	return telemetry.Config{Enabled: cfg.MetricsEnabled, Listen: cfg.MetricsListen,
 		PollInterval: time.Duration(cfg.MetricsPollInterval), OperationTimeout: time.Duration(cfg.OperationTimeout),
 		PlayerInterval: time.Duration(cfg.MetricsPlayerInterval),
-		PlayerDetails:  cfg.MetricsPlayerDetails, ServerDirectory: cfg.ServerDirectory}
+		PlayerDetails:  cfg.MetricsPlayerDetails, ServerDirectory: cfg.ServerDirectory,
+		Directories: cfg.MetricsDirectories, DirectoryInterval: time.Duration(cfg.MetricsDirectoryInterval), DirectoryTimeout: time.Duration(cfg.MetricsDirectoryTimeout)}
 }
 func parseLogLevel(value string) slog.Level {
 	if value == "debug" {
@@ -209,7 +210,7 @@ func (m *runtimeConfig) reload(ctx context.Context, expected string, requestedPa
 		return reloadResult{}, fmt.Errorf("reload rejected: %w", err)
 	}
 	if expected != "" && digest != expected {
-		return reloadResult{}, errors.New(".env changed after the request was prepared; run task config:reload again")
+		return reloadResult{}, errors.New(".env changed after the request was prepared; run mcs-bootloader config reload again")
 	}
 	old, metadata := m.snapshot()
 	if digest == metadata.SHA256 {
@@ -329,11 +330,11 @@ func (m *runtimeConfig) restartCheck(expected string) (map[string]any, error) {
 		return nil, err
 	}
 	if digest != expected {
-		return nil, errors.New(".env changed during validation; run task gateway:restart again")
+		return nil, errors.New(".env changed during validation; run mcs-bootloader gateway restart again")
 	}
 	old, metadata := m.snapshot()
 	if old.RCONPassword != next.RCONPassword {
-		return nil, errors.New("restart refused: apply MC_RCON_PASSWORD using task config:apply while Minecraft is stopped before restarting the gateway")
+		return nil, errors.New("restart refused: apply MC_RCON_PASSWORD using mcs-bootloader config reload while Minecraft is stopped before restarting the gateway")
 	}
 	return map[string]any{"valid": true, "configuration": metadata, "restart_fields": restartFields(old, next)}, nil
 }

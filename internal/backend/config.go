@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -42,42 +43,45 @@ type Config struct {
 	RCONAddress      string `json:"rcon_address"`
 	RCONPasswordFile string `json:"rcon_password_file"`
 	// RCONPassword lives only in the private .env, never a JSON response or log.
-	RCONPassword          string   `json:"-"`
-	Service               string   `json:"backend_service"`
-	StateDirectory        string   `json:"state_directory"`
-	AdminSocket           string   `json:"admin_socket"`
-	ServerDirectory       string   `json:"server_directory"`
-	LaunchExecutable      string   `json:"launch_executable"`
-	LaunchArgs            []string `json:"launch_args"`
-	Protocol              int      `json:"protocol"`
-	Version               string   `json:"version"`
-	MaxPlayers            int      `json:"max_players"`
-	MaxConnections        int      `json:"max_connections"`
-	IdleTimeout           Duration `json:"idle_timeout"`
-	PollInterval          Duration `json:"poll_interval"`
-	OperationTimeout      Duration `json:"operation_timeout"`
-	StartupTimeout        Duration `json:"startup_timeout"`
-	ShutdownWarnAfter     Duration `json:"shutdown_warn_after"`
-	WakeCooldown          Duration `json:"wake_cooldown"`
-	HandshakeTimeout      Duration `json:"handshake_timeout"`
-	DialTimeout           Duration `json:"dial_timeout"`
-	RestartGrace          Duration `json:"restart_grace"`
-	BootMessage           string   `json:"boot_message"`
-	SleepingMOTD          string   `json:"sleeping_motd"`
-	StartingMOTD          string   `json:"starting_motd"`
-	StoppingMOTD          string   `json:"stopping_motd"`
-	UnknownMOTD           string   `json:"unknown_motd"`
-	FailedMOTD            string   `json:"failed_motd"`
-	OverrideMOTD          bool     `json:"override_motd"`
-	MOTD                  string   `json:"motd"`
-	RestartMessage        string   `json:"restart_message"`
-	WhitelistMessage      string   `json:"whitelist_message"`
-	MetricsEnabled        bool     `json:"metrics_enabled"`
-	MetricsListen         string   `json:"metrics_listen"`
-	MetricsPollInterval   Duration `json:"metrics_poll_interval"`
-	MetricsPlayerInterval Duration `json:"metrics_player_interval"`
-	MetricsPlayerDetails  bool     `json:"metrics_player_details"`
-	LogLevel              string   `json:"log_level"`
+	RCONPassword             string            `json:"-"`
+	Service                  string            `json:"backend_service"`
+	StateDirectory           string            `json:"state_directory"`
+	AdminSocket              string            `json:"admin_socket"`
+	ServerDirectory          string            `json:"server_directory"`
+	LaunchExecutable         string            `json:"launch_executable"`
+	LaunchArgs               []string          `json:"launch_args"`
+	Protocol                 int               `json:"protocol"`
+	Version                  string            `json:"version"`
+	MaxPlayers               int               `json:"max_players"`
+	MaxConnections           int               `json:"max_connections"`
+	IdleTimeout              Duration          `json:"idle_timeout"`
+	PollInterval             Duration          `json:"poll_interval"`
+	OperationTimeout         Duration          `json:"operation_timeout"`
+	StartupTimeout           Duration          `json:"startup_timeout"`
+	ShutdownWarnAfter        Duration          `json:"shutdown_warn_after"`
+	WakeCooldown             Duration          `json:"wake_cooldown"`
+	HandshakeTimeout         Duration          `json:"handshake_timeout"`
+	DialTimeout              Duration          `json:"dial_timeout"`
+	RestartGrace             Duration          `json:"restart_grace"`
+	BootMessage              string            `json:"boot_message"`
+	SleepingMOTD             string            `json:"sleeping_motd"`
+	StartingMOTD             string            `json:"starting_motd"`
+	StoppingMOTD             string            `json:"stopping_motd"`
+	UnknownMOTD              string            `json:"unknown_motd"`
+	FailedMOTD               string            `json:"failed_motd"`
+	OverrideMOTD             bool              `json:"override_motd"`
+	MOTD                     string            `json:"motd"`
+	RestartMessage           string            `json:"restart_message"`
+	WhitelistMessage         string            `json:"whitelist_message"`
+	MetricsEnabled           bool              `json:"metrics_enabled"`
+	MetricsListen            string            `json:"metrics_listen"`
+	MetricsPollInterval      Duration          `json:"metrics_poll_interval"`
+	MetricsPlayerInterval    Duration          `json:"metrics_player_interval"`
+	MetricsPlayerDetails     bool              `json:"metrics_player_details"`
+	MetricsDirectories       map[string]string `json:"metrics_directories"`
+	MetricsDirectoryInterval Duration          `json:"metrics_directory_interval"`
+	MetricsDirectoryTimeout  Duration          `json:"metrics_directory_timeout"`
+	LogLevel                 string            `json:"log_level"`
 }
 
 func DefaultConfig() Config {
@@ -97,6 +101,7 @@ func DefaultConfig() Config {
 		MOTD: "Minecraft server", RestartMessage: "Gateway is restarting. Please reconnect in a moment.",
 		WhitelistMessage: "You are not whitelisted on this server.",
 		MetricsListen:    "127.0.0.1:9464", MetricsPollInterval: Duration(15 * time.Second), MetricsPlayerInterval: Duration(time.Minute), MetricsPlayerDetails: true,
+		MetricsDirectories: map[string]string{}, MetricsDirectoryInterval: Duration(5 * time.Minute), MetricsDirectoryTimeout: Duration(30 * time.Second),
 	}
 }
 
@@ -206,10 +211,13 @@ func (c Config) Validate() error {
 	if c.MetricsEnabled && ports[metricsNumber] {
 		return fmt.Errorf("enabled metrics must use a different port from the gateway, backend and RCON")
 	}
-	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "poll_interval": c.PollInterval, "operation_timeout": c.OperationTimeout, "startup_timeout": c.StartupTimeout, "shutdown_warn_after": c.ShutdownWarnAfter, "wake_cooldown": c.WakeCooldown, "handshake_timeout": c.HandshakeTimeout, "dial_timeout": c.DialTimeout, "restart_grace": c.RestartGrace, "metrics_poll_interval": c.MetricsPollInterval, "metrics_player_interval": c.MetricsPlayerInterval} {
+	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "poll_interval": c.PollInterval, "operation_timeout": c.OperationTimeout, "startup_timeout": c.StartupTimeout, "shutdown_warn_after": c.ShutdownWarnAfter, "wake_cooldown": c.WakeCooldown, "handshake_timeout": c.HandshakeTimeout, "dial_timeout": c.DialTimeout, "restart_grace": c.RestartGrace, "metrics_poll_interval": c.MetricsPollInterval, "metrics_player_interval": c.MetricsPlayerInterval, "metrics_directory_interval": c.MetricsDirectoryInterval, "metrics_directory_timeout": c.MetricsDirectoryTimeout} {
 		if d <= 0 {
 			return fmt.Errorf("%s must be positive", name)
 		}
+	}
+	if err := ValidateMetricsDirectories(c.MetricsDirectories); err != nil {
+		return err
 	}
 	if c.PollInterval > c.IdleTimeout {
 		return fmt.Errorf("poll_interval must not exceed idle_timeout")
@@ -231,6 +239,7 @@ func (c Config) Validate() error {
 // Clone keeps each applied configuration snapshot independent of callers.
 func (c Config) Clone() Config {
 	c.LaunchArgs = slices.Clone(c.LaunchArgs)
+	c.MetricsDirectories = maps.Clone(c.MetricsDirectories)
 	return c
 }
 
@@ -322,4 +331,23 @@ func ReadPassword(path string) (string, error) {
 		return "", fmt.Errorf("RCON password must be 16-4096 bytes without line breaks or NUL")
 	}
 	return password, nil
+}
+
+// Directory labels are operator-chosen names, never arbitrary discovered paths.
+// The count/path limits bound configuration and Prometheus label cardinality.
+var metricsDirectoryName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`)
+
+func ValidateMetricsDirectories(directories map[string]string) error {
+	if len(directories) > 32 {
+		return fmt.Errorf("MC_METRICS_DIRECTORIES supports at most 32 named directories")
+	}
+	for name, path := range directories {
+		if !metricsDirectoryName.MatchString(name) {
+			return fmt.Errorf("MC_METRICS_DIRECTORIES names must start with a letter and contain at most 64 ASCII letters, digits, dots, underscores or hyphens")
+		}
+		if !filepath.IsAbs(path) || filepath.Clean(path) == "/" || len(path) > 4096 || !utf8.ValidString(path) || strings.ContainsAny(path, "\x00\r\n") {
+			return fmt.Errorf("MC_METRICS_DIRECTORIES values must be absolute non-root paths of at most 4096 UTF-8 bytes without NUL or line breaks")
+		}
+	}
+	return nil
 }

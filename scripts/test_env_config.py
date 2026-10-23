@@ -164,6 +164,26 @@ class EnvConfigTests(unittest.TestCase):
             with self.subTest(invalid=invalid[:50]), self.assertRaises(env_config.EnvConfigError):
                 env_config.validate_values({"MC_LAUNCH_ARGS": invalid})
 
+    def test_metrics_directories_are_bounded_literal_named_paths(self):
+        paths = {"world": "/srv/minecraft/world", "backups": "/srv/backup $literal"}
+        raw = json.dumps(paths)
+        self.assertEqual(env_config.metrics_directories(raw), paths)
+        self.assertEqual(env_config.render_config({"MC_METRICS_DIRECTORIES": raw}, {}),
+                         {"metrics_directories": paths})
+        seeded = env_config.values_from_config({"metrics_directories": paths},
+                                               include_manage_defaults=False)
+        self.assertEqual(env_config.render_config(seeded, {}), {"metrics_directories": paths})
+        self.assertEqual(env_config.metrics_directories("{}"), {})
+        cases = ["null", "[]", '{"world":null}', '{"world":3}', '{"world":"relative"}',
+                 '{"world":"/"}', '{"world":"//"}', '{"world":"/foo/.."}',
+                 '{"bad name":"/srv/world"}', '{"world":"/a","world":"/b"}',
+                 '{"world":"/a\\nsecret"}', '{"world":"/a\\ud800"}',
+                 json.dumps({"A" * 65: "/srv/world"}), json.dumps({"world": "/" + "a" * 4096}),
+                 json.dumps({f"root{i}": "/srv/world" for i in range(33)})]
+        for invalid in cases:
+            with self.subTest(invalid=invalid[:60]), self.assertRaises(env_config.EnvConfigError):
+                env_config.validate_values({"MC_METRICS_DIRECTORIES": invalid})
+
     def test_duplicate_unknown_and_syntax_errors_never_echo_values(self):
         secret = "DO_NOT_ECHO_THIS_VALUE"
         cases = (

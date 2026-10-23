@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,7 +30,7 @@ func testConfig(t *testing.T) Config {
 	if err = os.WriteFile(filepath.Join(dir, "server.properties"), []byte("white-list=false\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	return Config{Enabled: true, Listen: addr, PollInterval: time.Hour, OperationTimeout: time.Second, PlayerInterval: time.Minute, ServerDirectory: dir}
+	return Config{Enabled: true, Listen: addr, PollInterval: time.Hour, OperationTimeout: time.Second, PlayerInterval: time.Minute, ServerDirectory: dir, DirectoryInterval: 5 * time.Minute, DirectoryTimeout: 30 * time.Second}
 }
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 func eventually(t *testing.T, fn func() bool) {
@@ -104,7 +105,7 @@ func TestPreparedBindingFailureAndAbortPreserveListener(t *testing.T) {
 	applied := m.cfg
 	generation := m.generation
 	m.mu.RUnlock()
-	if applied != cfg || generation != 1 {
+	if !reflect.DeepEqual(applied, cfg) || generation != 1 {
 		t.Fatal("failed bind changed applied configuration")
 	}
 	client := &http.Client{Timeout: time.Second}

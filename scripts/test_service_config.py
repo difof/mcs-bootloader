@@ -111,6 +111,11 @@ class GatewayServiceConfigTests(unittest.TestCase):
         self.assertFalse(self.drop_directory.exists())
         self.assertEqual(self.reloads(), 0)
 
+    def test_json_logging_flag_in_new_service_template_is_accepted(self):
+        self.exec_argv += ["--json"]
+        self.assertTrue(self.configure())
+        self.assertEqual(self.reloads(), 1)
+
     def test_missing_or_pending_unit_is_refused_before_writing(self):
         self.loaded = False
         with self.assertRaisesRegex(RuntimeError, "missing"):

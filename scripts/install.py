@@ -6,7 +6,6 @@ files. Activation failures retain the validated installation for inspection: a
 backend might already be starting, so automatic world/config rollback is unsafe.
 """
 
-import argparse
 import datetime
 import errno
 import grp
@@ -20,7 +19,6 @@ import re
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 
 from env_config import MANAGE_DEFAULTS, RUNTIME_DEFAULTS, launch_arguments, read_env
@@ -54,7 +52,7 @@ def safe_text(value):
     return value
 
 
-def installation_settings(env_path):
+def installation_settings(env_path, *, check_topology=True):
     """Read the one private source without exposing values in diagnostics."""
     metadata = env_path.lstat()
     require(stat.S_ISREG(metadata.st_mode), "first-install .env must be a regular file, not a symlink")
@@ -71,8 +69,9 @@ def installation_settings(env_path):
             "replace the MC_RCON_PASSWORD example placeholder before installation")
     launch_arguments(settings["MC_LAUNCH_ARGS"])
     network_settings(settings)
-    for key, value in FIXED_SETTINGS.items():
-        require(settings[key] == value, f"{key} must match the bundled installation topology")
+    if check_topology:
+        for key, value in FIXED_SETTINGS.items():
+            require(settings[key] == value, f"{key} must match the bundled installation topology")
     return settings, raw, metadata
 
 
@@ -252,11 +251,11 @@ def backup_paths(settings):
 
 
 def verify_backup(backup, server, original):
-    """Check the completed full-server archive produced by task backup."""
+    """Check the completed full-server archive produced by the backup command."""
     archive = backup / "server-before-bootloader.tar.zst"
     manifest_path = backup / "backup.json"
     require(archive.is_file() and not archive.is_symlink() and archive.stat().st_size > 0,
-            "full-server backup is missing; run task backup with Minecraft and its launcher stopped")
+            "full-server backup is missing; run mcs-bootloader backup with Minecraft and its launcher stopped")
     require(manifest_path.is_file() and not manifest_path.is_symlink(), "backup completion manifest is missing")
     manifest = json.loads(manifest_path.read_text())
     require(manifest.get("format") == 1 and manifest.get("server_directory") == str(server),
@@ -274,7 +273,7 @@ def verify_backup(backup, server, original):
 def create_backup(env_path):
     """Snapshot the entire stopped server, including custom world directory names."""
     require(os.geteuid() == 0, "backup requires sudo")
-    settings, _, env_metadata = installation_settings(env_path.resolve(strict=True))
+    settings, _, env_metadata = installation_settings(env_path.resolve(strict=True), check_topology=False)
     account = pwd.getpwnam(safe_text(settings["MC_SERVICE_USER"]))
     require(account.pw_uid != 0, "the Minecraft account must not be root")
     server, backup = backup_paths(settings)
@@ -301,7 +300,7 @@ def create_backup(env_path):
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
     try:
-        print("Creating a full-server backup; Minecraft and its old launcher must stay stopped.", flush=True)
+        print("Creating a full-server backup; Minecraft, its old launcher and the gateway must stay stopped.", flush=True)
         run(["/usr/bin/tar", "--zstd", "--create", "--file", str(temporary), "--directory", str(server), "."], timeout=3600)
         stopped_and_ports_free(account.pw_uid, settings, server)
         require(props.read_bytes() == original, "server.properties changed during backup")
@@ -318,11 +317,13 @@ def create_backup(env_path):
         write_atomic(backup / "backup.json", (json.dumps(manifest, indent=2) + "\n").encode(),
                      0o600, env_metadata.st_uid, env_metadata.st_gid)
         print(f"Verified full-server backup: {archive}")
+        return {"archive": str(archive), "sha256": manifest["archive_sha256"],
+                "server_directory": str(server)}
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def install(env_path, report_path):
+def install(env_path, report_path, *, binary_path):
     require(os.geteuid() == 0, "installer must run as root")
     settings, original_env, env_metadata = installation_settings(env_path)
     user = safe_text(settings["MC_SERVICE_USER"])
@@ -358,8 +359,9 @@ def install(env_path, report_path):
         run(["/usr/sbin/runuser", "-u", user, "--", "/usr/bin/test", permission, str(path)])
     password = settings["MC_RCON_PASSWORD"]
     replacement = updated_properties(original, password, settings["MC_BACKEND_ADDRESS"], settings["MC_RCON_ADDRESS"])
-    binary = (ROOT / "bin/mcs-bootloader").read_bytes()
-    require(binary.startswith(b"\x7fELF"), "bin/mcs-bootloader is not a built Linux executable")
+    source_binary = Path(binary_path)
+    binary = source_binary.read_bytes()
+    require(binary.startswith(b"\x7fELF"), "the installation source is not a Linux executable")
     created, directories, changed_props, reloaded, linked_env = [], [], False, False, False
     report = {"created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "validating",
               "user": user, "server_directory": str(server), "backup_directory": str(backup),
@@ -428,8 +430,10 @@ def install(env_path, report_path):
         run(["/usr/bin/systemctl", "enable", "--now", "mcs-bootloader.service"])
         report["status"], report["phase"] = "installed", "complete"
         save_report()
-        print(json.dumps({"status": "installed", "gateway": "enabled", "backend": "not explicitly started or enabled",
-                          "report": str(report_path)}))
+        result = {"status": "installed", "gateway": "enabled", "backend": "not explicitly started or enabled",
+                  "report": str(report_path), "configuration": str(roots[1] / ".env")}
+        print(json.dumps(result))
+        return result
     except Exception as exc:
         failure_phase = report["phase"]
         rollback_errors = []
@@ -470,19 +474,3 @@ def install(env_path, report_path):
         except Exception as report_error:
             rollback_errors.append(f"report: {report_error}")
         raise RuntimeError(f"installation failed during {failure_phase}: {exc}; rollback notes: {rollback_errors}") from exc
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", type=Path, required=True)
-    parser.add_argument("--report", type=Path, default=Path(".local/installation.json"))
-    parser.add_argument("--backup", action="store_true", help="create and verify a full backup of the stopped server")
-    args = parser.parse_args()
-    try:
-        if args.backup:
-            create_backup(args.env.absolute())
-        else:
-            install(args.env.absolute(), args.report.absolute())
-    except Exception as failure:
-        print(f"mcs-bootloader install: {failure}", file=sys.stderr)
-        sys.exit(1)

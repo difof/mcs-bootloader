@@ -8,9 +8,12 @@ MC_METRICS_LISTEN=127.0.0.1:9464
 MC_METRICS_POLL_INTERVAL=15s
 MC_METRICS_PLAYER_DETAILS=true
 MC_METRICS_PLAYER_INTERVAL=60s
+MC_METRICS_DIRECTORIES='{"world":"/srv/minecraft/world","backups":"/srv/minecraft-backups"}'
+MC_METRICS_DIRECTORY_INTERVAL=5m
+MC_METRICS_DIRECTORY_TIMEOUT=30s
 ```
 
-Apply edits with `task config:reload -- .env`. All five settings are live. A port conflict rejects the entire reload and keeps the old listener and applied configuration. Disabling metrics closes its listener and stops polling. `task metrics` reads the same metrics through the private administration socket, using the daemon's applied configuration.
+Apply edits with `mcs-bootloader config reload --env /etc/mcs-bootloader/.env`. All metrics settings are live. A port conflict rejects the entire reload and keeps the old listener and applied configuration. Disabling metrics closes its listener and stops polling. `mcs-bootloader metrics` reads the same metrics through the private administration socket, using the daemon's applied configuration.
 
 Example Prometheus scrape configuration:
 
@@ -51,7 +54,7 @@ Every collector has these metrics with a fixed `collector` label:
 
 Collector names are `self`, `whitelist`, `minecraft_players`, `minecraft_player_details`, `minecraft_ticks`, `minecraft_status`, `jvm_process` and `jvm_perfdata`.
 
-Failed or unavailable readings are omitted rather than represented as zero. Player detail fields have individual timestamps because a bounded batch can finish only some fields. Those successful fields remain visible until the next detail batch; failed fields from that batch are absent. `mcs_minecraft_player_details_available=0` marks an incomplete batch. JVM and online-server data are suppressed when the controller reports a stopped/unknown backend, and cached JVM samples are suppressed if systemd's PID changes.
+Failed or unavailable server readings are omitted rather than represented as zero. Directory scans retain their last complete successful totals and explicitly report scan failure and sample age, as described below. Player detail fields have individual timestamps because a bounded batch can finish only some fields. Those successful fields remain visible until the next detail batch; failed fields from that batch are absent. `mcs_minecraft_player_details_available=0` marks an incomplete batch. JVM and online-server data are suppressed when the controller reports a stopped/unknown backend, and cached JVM samples are suppressed if systemd's PID changes.
 
 `mcs_metrics_collection_timestamp_seconds` and `mcs_metrics_cache_age_seconds` describe the published background snapshot. `process_metrics_available` distinguishes Linux self-process accounting from the Go runtime statistics that can still be collected without it. `mcs_whitelist_known` reports whether the native whitelist read succeeded; the enabled flag is absent when unknown.
 
@@ -78,6 +81,32 @@ Gateway counters use the prefix `mcs_gateway_` and suffix `_total`:
 `accepted_connections`, `capacity_rejections`, `invalid_requests`, `status_requests`, `login_requests`, `wake_requests`, `wake_limited`, `routed_connections`, `backend_errors`, `whitelist_denied`, `whitelist_errors`, `draining_rejections`.
 
 Metrics configuration is exported as `mcs_metrics_enabled`, `mcs_metrics_poll_interval_seconds`, `mcs_metrics_player_interval_seconds` and `mcs_metrics_player_details_enabled`. HTTP instrumentation is `mcs_metrics_http_requests_total`, `mcs_metrics_http_errors_total` and `mcs_metrics_http_duration_seconds_total`.
+
+### Directory sizes
+
+`MC_METRICS_DIRECTORIES` is a JSON object of stable names to absolute directory paths. It defaults to `{}`. The service account needs read/traverse permission for every selected directory. Use names such as `world`, `backups` and `mods`; filesystem paths are not exposed as metric labels. Up to 32 roots are supported. Names start with a letter and contain up to 64 ASCII letters, digits, dots, underscores or hyphens.
+
+A separate worker scans these paths without reading file contents and while Minecraft is asleep or running. `MC_METRICS_DIRECTORY_INTERVAL` defaults to `5m` after a scan cycle completes; `MC_METRICS_DIRECTORY_TIMEOUT` defaults to `30s` per root. Scans never run in parallel with another directory scan and cannot delay ordinary player/JVM collection, control commands, or scrapes. Reload cancels the current cycle, removes deleted or changed-path samples immediately, and scans the new configuration. Disabling metrics stops scheduling scans.
+
+Traversal refuses symlinks in the root path and skips discovered symlinks, sockets, devices and FIFOs. Configure the real directory path rather than a symlink. Hardlinked regular files are counted once within each root; overlapping configured roots are independent totals and should not be summed. Subdirectories on a different device are skipped, so configure such mounts as separate roots. A defensive bound of one million entries and 256 nested levels prevents unbounded scans. A limit, permission error, removed file, or timeout fails the complete attempt; partial totals are never published.
+
+The timeout is cooperative between filesystem operations. A hung kernel filesystem operation can take longer, particularly on an unavailable network mount. There is still only one directory worker, and shutdown does not wait for that worker. Prefer local directories for predictable collection latency. These are sampled totals, not a filesystem snapshot: files may change while a scan runs.
+
+All per-root metrics use the `directory` label:
+
+| Metric | Meaning |
+| --- | --- |
+| `mcs_directory_size_bytes` | Logical size of unique regular files from the last complete successful scan. |
+| `mcs_directory_allocated_bytes` | Allocated file blocks × 512; sparse files can be smaller than their logical size. Directory metadata is excluded, and filesystem compression/reflinks can affect interpretation. |
+| `mcs_directory_files`, `mcs_directory_directories` | Unique regular-file and directory counts; directory count includes the root. |
+| `mcs_directory_symlinks_skipped`, `mcs_directory_special_files_skipped`, `mcs_directory_mounts_skipped` | Exclusions from the last successful scan. |
+| `mcs_directory_scan_success` | Whether the last completed attempt succeeded. Zero before the first successful attempt or after an error. |
+| `mcs_directory_scan_in_progress` | Whether this root is currently being scanned. |
+| `mcs_directory_scan_errors_total` | Failed complete attempts; reload/shutdown cancellations are excluded. |
+| `mcs_directory_scan_duration_seconds`, `mcs_directory_scan_last_attempt_timestamp_seconds` | Latest completed attempt duration and latest attempt start time. |
+| `mcs_directory_scan_last_success_timestamp_seconds`, `mcs_directory_scan_age_seconds` | Completion time and age of the retained successful totals. |
+
+Sizes/counts are absent until the first complete scan succeeds. On later failures, the last good values remain, accompanied by `scan_success=0` and increasing age; do not mistake them for a current measurement or an empty folder. Removing a root or changing its path clears its cache and counters. The listener also exposes `mcs_metrics_directories_configured`, `mcs_metrics_directory_interval_seconds` and `mcs_metrics_directory_timeout_seconds`.
 
 ### RCON
 
@@ -180,6 +209,12 @@ sum by (instance) (mcs_jvm_memory_pool_used_bytes)
 
 # Age of each player's health reading
 time() - mcs_minecraft_player_field_timestamp_seconds{field="Health"}
+
+# Last successful logical size per configured root, in GiB
+mcs_directory_size_bytes / 1024^3
+
+# Directory roots whose latest completed scan failed
+mcs_directory_scan_success == 0
 
 # Gateway p95 RCON request duration by operation
 histogram_quantile(0.95,

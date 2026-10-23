@@ -218,6 +218,7 @@ func (m *Manager) points(cfg Config, cache collection, snapshot Snapshot, stats 
 			points = append(points, cache.Points[name]...)
 		}
 	}
+	points = append(points, m.directoryPoints(cfg)...)
 	return points
 }
 

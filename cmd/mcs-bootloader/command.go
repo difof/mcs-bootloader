@@ -85,7 +85,7 @@ func operatorError(ctx context.Context, err error) error {
 	}
 	var operation *net.OpError
 	if errors.As(err, &operation) && operation.Op == "dial" {
-		return fmt.Errorf("Minecraft RCON is unavailable; the server may be asleep or starting. Use task start and wait for ready: %w", err)
+		return fmt.Errorf("Minecraft RCON is unavailable; the server may be asleep or starting. Use mcs-bootloader start and wait for ready: %w", err)
 	}
 	return fmt.Errorf("RCON command failed; it may already have executed and was not retried: %w", err)
 }
@@ -113,7 +113,7 @@ func operatorCommand(args []string) (string, error) {
 	command = strings.TrimSpace(command)
 	command = strings.TrimPrefix(command, "/")
 	if strings.TrimSpace(command) == "" {
-		return "", errors.New("a Minecraft command is required; for example: task command -- op PlayerName")
+		return "", errors.New("a Minecraft command is required; for example: mcs-bootloader command -- op PlayerName")
 	}
 	return command, nil
 }

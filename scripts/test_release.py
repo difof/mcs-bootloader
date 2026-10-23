@@ -1,8 +1,10 @@
-import io
+import hashlib
+import json
 from pathlib import Path
-import tarfile
+import struct
 import tempfile
 import unittest
+from unittest import mock
 
 import release
 
@@ -68,21 +70,21 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "full Git history"):
                 release.git_changelog("v0.4.0", clone)
 
-    def test_notes_render_subjects_as_text_and_explain_generation(self):
+    def test_notes_render_subjects_without_removed_boilerplate(self):
         commit = "a" * 40
         metadata = {"commit": commit, "go_toolchain": "go version go1.24.6 linux/amd64"}
         notes = release.release_notes("v0.4.0", [(commit, "[click](bad) <script> `code`")],
                                       metadata, "owner/repository", "v0.3.0")
         self.assertTrue(notes.startswith("## Changelog\n"))
         self.assertIn("compare/v0.3.0...v0.4.0", notes)
-        self.assertIn("Generated automatically from Git commit subjects", notes)
         self.assertIn(r"\[click\]\(bad\) &lt;script&gt; \`code\`", notes)
         self.assertIn(f"https://github.com/owner/repository/commit/{commit}", notes)
-        for forbidden in ("## Highlights", "## Downloads", "## Install or update", "<script>"):
+        for forbidden in ("## Highlights", "## Downloads", "## Install or update", "<script>",
+                          "Generated automatically", "There is no manually maintained changelog file",
+                          "highest earlier stable version", "Automated tests run on amd64"):
             self.assertNotIn(forbidden, notes)
         first = release.release_notes("v0.3.0", [(commit, "First release")], metadata, "owner/repository")
         self.assertIn("/commits/v0.3.0", first)
-        self.assertIn("complete history through `v0.3.0`", first)
 
     def test_manifest_excludes_untracked_and_rejects_secret_or_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -97,25 +99,55 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn("CHANGELOG.md", release.package_files(root, names + ["CHANGELOG.md"]))
             with self.assertRaises(ValueError):
                 release.package_files(root, names + [".env"])
+            with self.assertRaises(ValueError):
+                release.package_files(root, names + [".mcs-bootloader-installation.json"])
             (root / "README.md").unlink()
             (root / "README.md").symlink_to(root / ".env")
             with self.assertRaises(ValueError):
                 release.package_files(root, names)
 
-    def test_archive_is_reproducible_and_normalizes_modes_and_owners(self):
-        files = [("bin/mcs-bootloader", b"test binary", True), (".env.example", b"sample only", False)]
+    def test_package_contains_only_two_executables_metadata_and_checksums(self):
         with tempfile.TemporaryDirectory() as temporary:
-            first, second = Path(temporary) / "a.tar.gz", Path(temporary) / "b.tar.gz"
-            release.write_archive(first, "mcs-bootloader_v0.3.0_linux_amd64", files, 1000000000)
-            release.write_archive(second, "mcs-bootloader_v0.3.0_linux_amd64", list(reversed(files)), 1000000000)
-            self.assertEqual(first.read_bytes(), second.read_bytes())
-            with tarfile.open(fileobj=io.BytesIO(first.read_bytes()), mode="r:gz") as archive:
-                members = archive.getmembers()
-                self.assertEqual(len(members), 2)
-                for member in members:
-                    self.assertTrue(member.isfile())
-                    self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 1000000000))
-                    self.assertEqual(member.mode, 0o755 if "/bin/" in member.name else 0o644)
+            root = Path(temporary)
+            self.make_repository(root)
+            for name in release.REQUIRED_FILES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture source")
+            (root / ".gitignore").write_text("/dist/\n")
+            release.run(["git", "add", "."], root=root)
+            self.commit(root, "Ship standalone operator commands")
+            original_run = release.run
+            def fake_build(argv, *, root=root, env=None):
+                if argv[:2] == ["go", "version"]:
+                    return "go version go1.24.6 linux/amd64"
+                if argv[:2] == ["go", "build"]:
+                    header = bytearray(20)
+                    header[:6] = b"\x7fELF\x02\x01"
+                    struct.pack_into("<H", header, 18, release.ARCHITECTURES[env["GOARCH"]])
+                    Path(argv[argv.index("-o") + 1]).write_bytes(header)
+                    self.assertEqual(env["CGO_ENABLED"], "0")
+                    self.assertEqual(env["GOOS"], "linux")
+                    return ""
+                return original_run(argv, root=root, env=env)
+            with mock.patch.object(release, "run", side_effect=fake_build):
+                release.package("v0.5.0", root)
+            destination = root / "dist/v0.5.0"
+            names = {"mcs-bootloader_v0.5.0_linux_amd64", "mcs-bootloader_v0.5.0_linux_arm64",
+                     "build-info.json", "SHA256SUMS", "RELEASE_NOTES.md"}
+            self.assertEqual({p.name for p in destination.iterdir()}, names)
+            checksums = (destination / "SHA256SUMS").read_text().splitlines()
+            self.assertEqual(len(checksums), 3)
+            for line in checksums:
+                digest, name = line.split("  ")
+                self.assertEqual(digest, hashlib.sha256((destination / name).read_bytes()).hexdigest())
+            for architecture in release.ARCHITECTURES:
+                binary = destination / f"mcs-bootloader_v0.5.0_linux_{architecture}"
+                release.validate_binary(binary, architecture)
+                self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+            info = json.loads((destination / "build-info.json").read_text())
+            self.assertEqual(info["distribution"], "standalone-binary")
+            self.assertEqual(info["operator_assets"], "embedded")
 
 
 if __name__ == "__main__":

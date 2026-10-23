@@ -621,10 +621,7 @@ func TestConfigurationSocketAllowsJSONExpansionWithinItsBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer output.Close()
-	stdout := os.Stdout
-	os.Stdout = output
-	defer func() { os.Stdout = stdout }()
-	if err := adminClient("config", []string{"--socket", f.socket}); err != nil {
+	if err := executeCLI(context.Background(), []string{"config", "live", "--socket", f.socket, "--json"}, newCLIOutput(output, io.Discard)); err != nil {
 		t.Fatalf("config CLI could not read valid expanded configuration: %v", err)
 	}
 	body, err := os.ReadFile(output.Name())
@@ -792,7 +789,7 @@ func TestRestartCheckCannotBypassPasswordRotation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = f.m.restartCheck(digest); err == nil || !strings.Contains(err.Error(), "config:apply") {
+			if _, err = f.m.restartCheck(digest); err == nil || !strings.Contains(err.Error(), "mcs-bootloader config reload") {
 				t.Fatalf("restart bypassed password apply: %v", err)
 			}
 			after, current := f.m.snapshot()

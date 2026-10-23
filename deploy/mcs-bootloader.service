@@ -9,7 +9,7 @@ Type=exec
 User=minecraft
 Group=minecraft
 WorkingDirectory=/
-ExecStart=/opt/mcs-bootloader/bin/mcs-bootloader serve --config /etc/mcs-bootloader/.env
+ExecStart=/opt/mcs-bootloader/bin/mcs-bootloader serve --config /etc/mcs-bootloader/.env --json
 Restart=on-failure
 RestartSec=5s
 # The daemon bounds RCON notification and relay draining using its .env timers.

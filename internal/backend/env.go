@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -55,17 +56,19 @@ func LoadEnv(data []byte) (Config, error) {
 		"MC_LOG_LEVEL":         &c.LogLevel,
 	}
 	durationFields := map[string]*Duration{
-		"MC_IDLE_TIMEOUT":            &c.IdleTimeout,
-		"MC_POLL_INTERVAL":           &c.PollInterval,
-		"MC_OPERATION_TIMEOUT":       &c.OperationTimeout,
-		"MC_STARTUP_TIMEOUT":         &c.StartupTimeout,
-		"MC_SHUTDOWN_WARN_AFTER":     &c.ShutdownWarnAfter,
-		"MC_WAKE_COOLDOWN":           &c.WakeCooldown,
-		"MC_HANDSHAKE_TIMEOUT":       &c.HandshakeTimeout,
-		"MC_DIAL_TIMEOUT":            &c.DialTimeout,
-		"MC_RESTART_GRACE":           &c.RestartGrace,
-		"MC_METRICS_POLL_INTERVAL":   &c.MetricsPollInterval,
-		"MC_METRICS_PLAYER_INTERVAL": &c.MetricsPlayerInterval,
+		"MC_IDLE_TIMEOUT":               &c.IdleTimeout,
+		"MC_POLL_INTERVAL":              &c.PollInterval,
+		"MC_OPERATION_TIMEOUT":          &c.OperationTimeout,
+		"MC_STARTUP_TIMEOUT":            &c.StartupTimeout,
+		"MC_SHUTDOWN_WARN_AFTER":        &c.ShutdownWarnAfter,
+		"MC_WAKE_COOLDOWN":              &c.WakeCooldown,
+		"MC_HANDSHAKE_TIMEOUT":          &c.HandshakeTimeout,
+		"MC_DIAL_TIMEOUT":               &c.DialTimeout,
+		"MC_RESTART_GRACE":              &c.RestartGrace,
+		"MC_METRICS_POLL_INTERVAL":      &c.MetricsPollInterval,
+		"MC_METRICS_PLAYER_INTERVAL":    &c.MetricsPlayerInterval,
+		"MC_METRICS_DIRECTORY_INTERVAL": &c.MetricsDirectoryInterval,
+		"MC_METRICS_DIRECTORY_TIMEOUT":  &c.MetricsDirectoryTimeout,
 	}
 	booleanFields := map[string]*bool{"MC_OVERRIDE_MOTD": &c.OverrideMOTD, "MC_METRICS_ENABLED": &c.MetricsEnabled, "MC_METRICS_PLAYER_DETAILS": &c.MetricsPlayerDetails}
 	var logLines int
@@ -95,7 +98,7 @@ func LoadEnv(data []byte) (Config, error) {
 			return c, envError(number, "", "expected KEY=value")
 		}
 		key, literal := parts[1], parts[2]
-		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && booleanFields[key] == nil && !taskFields[key] && key != "MC_LAUNCH_ARGS" {
+		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && booleanFields[key] == nil && !taskFields[key] && key != "MC_LAUNCH_ARGS" && key != "MC_METRICS_DIRECTORIES" {
 			return c, envError(number, key, "unknown setting")
 		}
 		if seen[key] {
@@ -136,6 +139,14 @@ func LoadEnv(data []byte) (Config, error) {
 		}
 		if err := validateEnvString(key, value); err != nil {
 			return c, envError(number, key, err.Error())
+		}
+		if key == "MC_METRICS_DIRECTORIES" {
+			directories, err := parseMetricsDirectories(value)
+			if err != nil {
+				return c, envError(number, key, err.Error())
+			}
+			c.MetricsDirectories = directories
+			continue
 		}
 		if key == "MC_LAUNCH_ARGS" {
 			var encoded []json.RawMessage
@@ -296,4 +307,51 @@ func validJSONSurrogates(literal string) bool {
 		}
 	}
 	return true
+}
+
+func parseMetricsDirectories(value string) (map[string]string, error) {
+	fail := func() (map[string]string, error) {
+		return nil, fmt.Errorf("must be a JSON object of unique names to directory path strings")
+	}
+	if !validJSONSurrogates(value) {
+		return fail()
+	}
+	d := json.NewDecoder(strings.NewReader(value))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return fail()
+	}
+	result := make(map[string]string)
+	for d.More() {
+		token, err = d.Token()
+		if err != nil {
+			return fail()
+		}
+		key, ok := token.(string)
+		if !ok {
+			return fail()
+		}
+		if _, exists := result[key]; exists {
+			return fail()
+		}
+		var raw json.RawMessage
+		if d.Decode(&raw) != nil || len(raw) == 0 || raw[0] != '"' {
+			return fail()
+		}
+		var path string
+		if json.Unmarshal(raw, &path) != nil {
+			return fail()
+		}
+		result[key] = path
+	}
+	if token, err = d.Token(); err != nil || token != json.Delim('}') {
+		return fail()
+	}
+	if d.Decode(new(any)) != io.EOF {
+		return fail()
+	}
+	if err := ValidateMetricsDirectories(result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

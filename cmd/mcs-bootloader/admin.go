@@ -3,16 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/difof/mcs-bootloader/internal/backend"
@@ -76,7 +72,7 @@ func adminHandler(c *control.Controller, s *gateway.Server, m *runtimeConfig) ht
 	mux.HandleFunc("GET /v1/metrics", func(w http.ResponseWriter, r *http.Request) {
 		cfg, _ := m.snapshot()
 		if !cfg.MetricsEnabled || m.metrics == nil {
-			http.Error(w, "metrics are disabled; set MC_METRICS_ENABLED=true in .env and run task config:reload", http.StatusServiceUnavailable)
+			http.Error(w, "metrics are disabled; set MC_METRICS_ENABLED=true in .env and run mcs-bootloader config reload", http.StatusServiceUnavailable)
 			return
 		}
 		// The same cache serves both endpoints; this route needs neither a
@@ -216,71 +212,6 @@ func socketRequest(ctx context.Context, socket, method, path string, body any, l
 		return nil, fmt.Errorf("%s: %s", response.Status, string(data))
 	}
 	return data, nil
-}
-
-func adminClient(command string, args []string) error {
-	flags := flag.NewFlagSet(command, flag.ContinueOnError)
-	socket := flags.String("socket", "/run/mcs-bootloader/control.sock", "admin Unix socket")
-	configPath := flags.String("config", defaultConfigPath, "configuration file to apply")
-	envPath := flags.String("env", "", "explicit .env source to reload (same file as the running daemon)")
-	expected := flags.String("expected-sha256", "", "optional SHA-256 of the caller's validated .env snapshot")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return errors.New("unexpected arguments")
-	}
-	method := "GET"
-	if command != "status" && command != "config" && command != "metrics" {
-		method = "POST"
-	}
-	var body any
-	if command == "reload" || command == "restart-check" {
-		requestPath := ""
-		if *envPath != "" {
-			var err error
-			requestPath, err = filepath.Abs(*envPath)
-			if err != nil {
-				return err
-			}
-			*configPath = requestPath
-		}
-		_, digest, err := readConfigSnapshot(*configPath)
-		if err != nil {
-			return err
-		}
-		if *expected != "" {
-			decoded, err := hex.DecodeString(*expected)
-			if err != nil || len(decoded) != 32 {
-				return errors.New("expected-sha256 must contain 64 hexadecimal characters")
-			}
-			if *expected != digest {
-				return errors.New(".env changed after validation; prepare the request again")
-			}
-		}
-		body = reloadRequest{ExpectedSHA256: digest, EnvPath: requestPath}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	limit := int64(65536)
-	if command == "config" {
-		limit = maxConfigResponseBytes
-	}
-	if command == "metrics" {
-		limit = maxMetricsResponseBytes
-	}
-	data, err := socketRequest(ctx, *socket, method, command, body, limit)
-	if err != nil {
-		return err
-	}
-	var value any
-	if json.Unmarshal(data, &value) == nil {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(value)
-	}
-	_, err = os.Stdout.Write(data)
-	return err
 }
 
 func appliedBackendConfig(socket string) (backend.Config, error) {
