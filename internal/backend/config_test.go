@@ -3,11 +3,16 @@ package backend
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
 
 func TestConfigPrivateBoundary(t *testing.T) {
 	good := DefaultConfig()
+	if good.IdleTimeout != Duration(15*time.Minute) {
+		t.Fatal("default idle shutdown must be 15 minutes")
+	}
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -24,6 +29,25 @@ func TestConfigPrivateBoundary(t *testing.T) {
 		if c.Validate() == nil {
 			t.Fatalf("unsafe config accepted: %+v", c)
 		}
+	}
+}
+
+func TestExampleMatchesRuntimeDefaults(t *testing.T) {
+	data, err := os.ReadFile("../../.env.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadEnv(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := DefaultConfig()
+	// A new .env uses the inline placeholder; the legacy JSON-only password
+	// file is intentionally absent from all operator configuration sources.
+	want.RCONPasswordFile = ""
+	want.RCONPassword = "replace-with-a-random-private-password"
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal(".env.example and Go runtime defaults differ")
 	}
 }
 

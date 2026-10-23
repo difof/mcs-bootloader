@@ -51,7 +51,6 @@ MC_GATEWAY_SERVICE=mcs-bootloader.service
 MC_LOG_NAMESPACE=mcs-bootloader
 MC_LOG_LINES=100
 MC_COMMAND_TIMEOUT=30s
-MC_BACKUP_DIRECTORY=/srv/minecraft-backups/pre-gateway
 `)
 	cfg, err := LoadEnv(data)
 	if err != nil {
@@ -118,6 +117,7 @@ func TestLoadEnvRejectsInvalidInputWithoutValues(t *testing.T) {
 	cases := map[string][]byte{
 		"missing secret":         []byte("MC_IDLE_TIMEOUT=1h\n"),
 		"legacy secret path":     envWith("MC_RCON_PASSWORD_FILE=" + secret),
+		"removed backup setting": envWith("MC_BACKUP_DIRECTORY=" + secret),
 		"unknown":                envWith("MC_UNKNOWN=" + secret),
 		"duplicate":              envWith("MC_RCON_PASSWORD=" + secret),
 		"invalid assignment":     envWith("not an assignment " + secret),

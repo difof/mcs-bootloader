@@ -223,16 +223,9 @@ def embedded_operate(action, arguments, env_path, executable):
         result.update(path=str(source), settings=redacted_values(values))
         return result
 
-    if action in ("install", "backup"):
+    if action == "install":
         import install
-        require(os.geteuid() == 0, "installation and backup require root")
-        if action == "backup":
-            require(not arguments, "backup takes no extra arguments; set MC_BACKUP_DIRECTORY in .env")
-            with contextlib.redirect_stdout(io.StringIO()):
-                data = install.create_backup(env_path)
-            result.update(data)
-            result["message"] = "Full Minecraft server backup created and verified."
-            return result
+        require(os.geteuid() == 0, "installation requires root")
         parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
         parser.add_argument("--report", type=Path, default=env_path.parent / ".mcs-bootloader-installation.json")
         parsed, unknown = parser.parse_known_args(arguments)

@@ -81,7 +81,7 @@ RUNTIME_DEFAULTS = {
     "MC_VERSION": "1.21.1",
     "MC_MAX_PLAYERS": 5,
     "MC_MAX_CONNECTIONS": 64,
-    "MC_IDLE_TIMEOUT": "1h",
+    "MC_IDLE_TIMEOUT": "15m",
     "MC_POLL_INTERVAL": "15s",
     "MC_OPERATION_TIMEOUT": "5s",
     "MC_STARTUP_TIMEOUT": "15m",
@@ -90,7 +90,7 @@ RUNTIME_DEFAULTS = {
     "MC_HANDSHAKE_TIMEOUT": "5s",
     "MC_DIAL_TIMEOUT": "3s",
     "MC_RESTART_GRACE": "3s",
-    "MC_BOOT_MESSAGE": "Server is booting up. Please reconnect in a few minutes.",
+    "MC_BOOT_MESSAGE": "Server is booting up. {eta} Please reconnect.",
     "MC_RESTART_MESSAGE": "Gateway is restarting. Please reconnect in a moment.",
     "MC_WHITELIST_MESSAGE": "You are not whitelisted on this server.",
     "MC_SLEEPING_MOTD": "Server is sleeping. Join to start it.",
@@ -119,7 +119,6 @@ MANAGE_DEFAULTS = {
     "MC_LOG_NAMESPACE": "mcs-bootloader",
     "MC_LOG_LINES": 100,
     "MC_COMMAND_TIMEOUT": "30s",
-    "MC_BACKUP_DIRECTORY": "/srv/minecraft-backups/pre-bootloader",
 }
 
 INTEGER_KEYS = frozenset({

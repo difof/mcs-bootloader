@@ -191,6 +191,7 @@ class EnvConfigTests(unittest.TestCase):
             (f"MC_UNKNOWN={secret}\n", "line 1: MC_UNKNOWN: unknown"),
             (f"PATH={secret}\n", "line 1: PATH: unknown"),
             (f"MC_RCON_PASSWORD_FILE={secret}\n", "line 1: MC_RCON_PASSWORD_FILE: unknown"),
+            (f"MC_BACKUP_DIRECTORY={secret}\n", "line 1: MC_BACKUP_DIRECTORY: unknown"),
             (f"MC_RCON_PASSWORD=first\nMC_RCON_PASSWORD={secret}\n",
              "line 2: MC_RCON_PASSWORD: duplicate"),
             (f'MC_RCON_PASSWORD="{secret}\\q"\n', "line 1: MC_RCON_PASSWORD: invalid JSON"),

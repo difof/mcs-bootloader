@@ -33,7 +33,7 @@ var serviceAccountPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]*\$?$`)
 
 var commandGroups = map[string]bool{"config": true, "gateway": true}
 var knownCommands = map[string]bool{
-	"help": true, "version": true, "init": true, "install": true, "backup": true, "deploy": true, "remove": true,
+	"help": true, "version": true, "init": true, "install": true, "deploy": true, "remove": true,
 	"status": true, "stats": true, "start": true, "wake": true, "stop": true, "sleep": true, "command": true, "metrics": true, "logs": true,
 	"config": true, "config new": true, "config link": true, "config init": true, "config edit": true, "config show": true, "config live": true, "config check": true, "config reload": true,
 	"gateway": true, "gateway start": true, "gateway stop": true, "gateway restart": true, "gateway configure": true,
@@ -252,7 +252,7 @@ func executeCLI(ctx context.Context, args []string, out *cliOutput) error {
 		return fmt.Errorf("%s takes no positional arguments", o.Command)
 	}
 	switch o.Command {
-	case "install", "backup", "deploy", "remove", "config edit", "config show", "gateway start", "gateway stop", "gateway restart", "gateway configure":
+	case "install", "deploy", "remove", "config edit", "config show", "gateway start", "gateway stop", "gateway restart", "gateway configure":
 		return runOperator(ctx, o, out, args)
 	case "check", "config check":
 		path, err := resolveEnv(o.Env, false)
@@ -351,7 +351,7 @@ func runOperator(ctx context.Context, o cliOptions, out *cliOutput, original []s
 	if err != nil {
 		return err
 	}
-	root := action == "install" || action == "backup" || action == "deploy" || action == "remove" || strings.HasPrefix(action, "gateway-")
+	root := action == "install" || action == "deploy" || action == "remove" || strings.HasPrefix(action, "gateway-")
 	if root && os.Geteuid() != 0 {
 		return reexecAs(ctx, "root", withEnvArgument(original, path), out)
 	}
@@ -405,7 +405,7 @@ func reexecAs(ctx context.Context, user string, args []string, out *cliOutput) e
 		return command.Process.Signal(syscall.SIGTERM)
 	}
 	// Wait for the child to finish its cleanup; there is no forced-kill deadline
-	// on a privileged installation/backup transaction.
+	// on a privileged installation transaction.
 	var diagnostic boundedText
 	if out.JSON {
 		command.Stderr = &diagnostic
@@ -654,6 +654,17 @@ func readBoundedFile(path string, limit int64) ([]byte, error) {
 }
 
 func runBackend(o cliOptions) error {
+	service, err := currentBackendServiceContext()
+	if err != nil {
+		return err
+	}
+	return runBackendInService(o, service)
+}
+
+func runBackendInService(o cliOptions, service backendServiceContext) error {
+	if err := service.validateIdentity(); err != nil {
+		return err
+	}
 	if len(o.Args) > 0 {
 		return errors.New("unexpected backend helper arguments")
 	}
@@ -691,6 +702,9 @@ func runBackend(o cliOptions) error {
 			}
 			cfg = disk
 		}
+	}
+	if err := service.validateService(cfg.Service); err != nil {
+		return err
 	}
 	if o.Command == "backend-start" {
 		return backend.StartServer(cfg)

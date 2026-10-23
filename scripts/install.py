@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""First-install only. Validate a stopped, backed-up server before activating the gateway.
+"""First-install only. Validate a stopped server before activating the gateway.
 
 Pre-activation failures restore properties and remove only this invocation's new
 files. Activation failures retain the validated installation for inspection: a
@@ -52,7 +52,7 @@ def safe_text(value):
     return value
 
 
-def installation_settings(env_path, *, check_topology=True):
+def installation_settings(env_path):
     """Read the one private source without exposing values in diagnostics."""
     metadata = env_path.lstat()
     require(stat.S_ISREG(metadata.st_mode), "first-install .env must be a regular file, not a symlink")
@@ -69,9 +69,8 @@ def installation_settings(env_path, *, check_topology=True):
             "replace the MC_RCON_PASSWORD example placeholder before installation")
     launch_arguments(settings["MC_LAUNCH_ARGS"])
     network_settings(settings)
-    if check_topology:
-        for key, value in FIXED_SETTINGS.items():
-            require(settings[key] == value, f"{key} must match the bundled installation topology")
+    for key, value in FIXED_SETTINGS.items():
+        require(settings[key] == value, f"{key} must match the bundled installation topology")
     return settings, raw, metadata
 
 
@@ -231,96 +230,12 @@ def stopped_and_ports_free(uid, settings=None, server=None):
                 raise RuntimeError(f"required TCP port {port} is unavailable on {address}: {exc}") from exc
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def backup_paths(settings):
+def server_directory(settings):
     server = Path(safe_text(settings["MC_SERVER_DIRECTORY"]))
-    backup = Path(safe_text(settings["MC_BACKUP_DIRECTORY"]))
-    require(server.is_absolute() and backup.is_absolute(), "server and backup paths must be absolute")
-    server, backup = server.resolve(strict=True), backup.resolve()
+    require(server.is_absolute(), "MC_SERVER_DIRECTORY must be an absolute path")
+    server = server.resolve(strict=True)
     require(server.is_dir() and server != Path("/"), "server path must be an existing non-root directory")
-    require(not backup.is_relative_to(server) and not server.is_relative_to(backup),
-            "backup directory must be separate from the Minecraft server directory")
-    return server, backup
-
-
-def verify_backup(backup, server, original):
-    """Check the completed full-server archive produced by the backup command."""
-    archive = backup / "server-before-bootloader.tar.zst"
-    manifest_path = backup / "backup.json"
-    require(archive.is_file() and not archive.is_symlink() and archive.stat().st_size > 0,
-            "full-server backup is missing; run mcs-bootloader backup with Minecraft and its launcher stopped")
-    require(manifest_path.is_file() and not manifest_path.is_symlink(), "backup completion manifest is missing")
-    manifest = json.loads(manifest_path.read_text())
-    require(manifest.get("format") == 1 and manifest.get("server_directory") == str(server),
-            "backup belongs to a different server directory or format")
-    require((backup / "server.properties").read_bytes() == original
-            and manifest.get("properties_sha256") == hashlib.sha256(original).hexdigest(),
-            "backup properties differ from the stopped server; create a fresh backup in a new directory")
-    require(sha256_file(archive) == manifest.get("archive_sha256"), "backup checksum does not match its completion manifest")
-    run(["/usr/bin/zstd", "--test", "--quiet", str(archive)], timeout=3600)
-    names = run(["/usr/bin/tar", "--zstd", "--list", "--file", str(archive)], timeout=3600).splitlines()
-    require("./server.properties" in names, "full-server backup does not contain server.properties")
-    return archive
-
-
-def create_backup(env_path):
-    """Snapshot the entire stopped server, including custom world directory names."""
-    require(os.geteuid() == 0, "backup requires sudo")
-    settings, _, env_metadata = installation_settings(env_path.resolve(strict=True), check_topology=False)
-    account = pwd.getpwnam(safe_text(settings["MC_SERVICE_USER"]))
-    require(account.pw_uid != 0, "the Minecraft account must not be root")
-    server, backup = backup_paths(settings)
-    props = server / "server.properties"
-    require(props.is_file() and not props.is_symlink(), "server.properties must be an ordinary file")
-    require(props.stat().st_uid == account.pw_uid, "server.properties is not owned by the selected service account")
-    stopped_and_ports_free(account.pw_uid, settings, server)
-    # Tar stores symlinks as links. Refuse external targets so this cannot be
-    # mistaken for a complete snapshot when a world is mounted via a symlink.
-    for directory, dirs, files in os.walk(server, followlinks=False):
-        for name in dirs + files:
-            path = Path(directory) / name
-            if path.is_symlink():
-                require(path.resolve().is_relative_to(server),
-                        "automatic backup does not support symlinks outside the server directory; use a server root containing the real data")
-    require(not backup.exists() or (backup.is_dir() and not any(backup.iterdir())),
-            "backup directory must be absent or empty; existing backups are never overwritten")
-    backup.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chown(backup, env_metadata.st_uid, env_metadata.st_gid)
-    os.chmod(backup, 0o700)
-    original = props.read_bytes()
-    archive = backup / "server-before-bootloader.tar.zst"
-    temporary = backup / ".server-backup.partial"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(descriptor)
-    try:
-        print("Creating a full-server backup; Minecraft, its old launcher and the gateway must stay stopped.", flush=True)
-        run(["/usr/bin/tar", "--zstd", "--create", "--file", str(temporary), "--directory", str(server), "."], timeout=3600)
-        stopped_and_ports_free(account.pw_uid, settings, server)
-        require(props.read_bytes() == original, "server.properties changed during backup")
-        run(["/usr/bin/zstd", "--test", "--quiet", str(temporary)], timeout=3600)
-        names = run(["/usr/bin/tar", "--zstd", "--list", "--file", str(temporary)], timeout=3600).splitlines()
-        require("./server.properties" in names, "backup archive is incomplete")
-        os.chown(temporary, env_metadata.st_uid, env_metadata.st_gid)
-        os.replace(temporary, archive)
-        write_atomic(backup / "server.properties", original, 0o600, env_metadata.st_uid, env_metadata.st_gid)
-        manifest = {"format": 1, "server_directory": str(server),
-                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "archive_sha256": sha256_file(archive),
-                    "properties_sha256": hashlib.sha256(original).hexdigest()}
-        write_atomic(backup / "backup.json", (json.dumps(manifest, indent=2) + "\n").encode(),
-                     0o600, env_metadata.st_uid, env_metadata.st_gid)
-        print(f"Verified full-server backup: {archive}")
-        return {"archive": str(archive), "sha256": manifest["archive_sha256"],
-                "server_directory": str(server)}
-    finally:
-        temporary.unlink(missing_ok=True)
+    return server
 
 
 def install(env_path, report_path, *, binary_path):
@@ -332,7 +247,7 @@ def install(env_path, report_path, *, binary_path):
     require(account.pw_uid != 0, "the gateway must not run as root")
     group = grp.getgrgid(account.pw_gid).gr_name
     require(re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", group) is not None, "unsupported group name")
-    server, backup = backup_paths(settings)
+    server = server_directory(settings)
     executable = launch_executable(server, settings["MC_LAUNCH_EXECUTABLE"])
     props = server / "server.properties"
     require(props.is_file() and not props.is_symlink(), "server.properties must be an ordinary file")
@@ -354,7 +269,6 @@ def install(env_path, report_path, *, binary_path):
         state = run(["/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value"], allowed=(0, 1))
         require(state == "not-found", f"refusing existing or uninspectable unit: {unit} ({state})")
     stopped_and_ports_free(account.pw_uid, settings, server)
-    verify_backup(backup, server, original)
     for path, permission in ((server, "-w"), (executable, "-x")):
         run(["/usr/sbin/runuser", "-u", user, "--", "/usr/bin/test", permission, str(path)])
     password = settings["MC_RCON_PASSWORD"]
@@ -364,7 +278,7 @@ def install(env_path, report_path, *, binary_path):
     require(binary.startswith(b"\x7fELF"), "the installation source is not a Linux executable")
     created, directories, changed_props, reloaded, linked_env = [], [], False, False, False
     report = {"created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "validating",
-              "user": user, "server_directory": str(server), "backup_directory": str(backup),
+              "user": user, "server_directory": str(server),
               "configuration": "/etc/mcs-bootloader/.env", "project_env": str(env_path),
               "operator_uid": env_metadata.st_uid,
               "original_properties": {"sha256": hashlib.sha256(original).hexdigest(),

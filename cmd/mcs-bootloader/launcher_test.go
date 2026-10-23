@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -23,16 +24,21 @@ import (
 	"github.com/difof/mcs-bootloader/internal/backend"
 )
 
-// The child invokes the actual CLI main and must be replaced by the fake Java
-// executable. Returning here indicates that backend-start did not exec it.
+// The child parses the real CLI and injects only its systemd process context;
+// the normal backend helper must replace it with the fake Java executable.
 func TestBackendStartExecHelper(t *testing.T) {
 	if os.Getenv("MCGW_LAUNCH_EXEC_HELPER") != "1" {
 		return
 	}
 	for i, argument := range os.Args {
 		if argument == "--" {
-			os.Args = append([]string{os.Args[0]}, os.Args[i+1:]...)
-			main()
+			o, err := parseCLI(os.Args[i+1:], newCLIOutput(io.Discard, io.Discard))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runBackendInService(o, fixtureBackendServiceContext("mcs-bootloader-backend.service")); err != nil {
+				t.Fatal(err)
+			}
 			os.Exit(90)
 		}
 	}

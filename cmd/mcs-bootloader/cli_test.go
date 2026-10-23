@@ -37,7 +37,7 @@ func TestCLIFlagsNeverConsumeMinecraftText(t *testing.T) {
 			t.Fatalf("got %+v, expected %q JSON=%v", got, tc.want, tc.json)
 		}
 	}
-	for _, args := range [][]string{{"command", "--timeout", "0s", "list"}, {"status", "--follow"}, {"logs", "--lines", "0"}, {"metrics", "--json", "--raw"}, {"status", "--pid", "1"}, {"remove", "--yes", "--dry-run"}} {
+	for _, args := range [][]string{{"backup"}, {"command", "--timeout", "0s", "list"}, {"status", "--follow"}, {"logs", "--lines", "0"}, {"metrics", "--json", "--raw"}, {"status", "--pid", "1"}, {"remove", "--yes", "--dry-run"}} {
 		if _, err := parseCLI(args, newCLIOutput(io.Discard, io.Discard)); err == nil {
 			t.Fatalf("accepted invalid flags %q", args)
 		}

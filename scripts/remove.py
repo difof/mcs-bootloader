@@ -2,7 +2,7 @@
 
 Removal requires an explicit --yes after a read-only plan. Unknown unit
 overrides and modified sudo/journal configuration are refused, never guessed.
-The canonical .env, state, journals, backups and native server settings remain.
+The canonical .env, state, journals and native server files remain.
 """
 
 import fcntl
@@ -137,7 +137,7 @@ def plan(env_path):
     return cfg, records, {"ok": True, "action": "remove", "applied": False,
                          "files": [str(path) for path in files],
                          "preserved": [str(canonical), values["MC_SERVER_DIRECTORY"],
-                                       values["MC_BACKUP_DIRECTORY"], values["MC_STATE_DIRECTORY"],
+                                       values["MC_STATE_DIRECTORY"],
                                        "Minecraft network settings", "system journal history"],
                          "message": "Removal plan only. Run remove --yes to remove these files after Minecraft is stopped."}
 
@@ -214,5 +214,5 @@ def remove(env_path, *, yes=False):
             directory.rmdir()
         except (FileNotFoundError, OSError):
             pass
-    result.update(applied=True, message="Gateway and owned installation files removed. Minecraft data, configuration, backups and native network settings were preserved.")
+    result.update(applied=True, message="Gateway and owned installation files removed. Minecraft data, configuration and native network settings were preserved.")
     return result

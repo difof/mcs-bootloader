@@ -1,8 +1,5 @@
 from pathlib import Path
-import hashlib
 import json
-import shutil
-import subprocess
 import tempfile
 import unittest
 
@@ -66,6 +63,8 @@ class InstallerValidationTests(unittest.TestCase):
             self.assertEqual(settings["MC_LAUNCH_EXECUTABLE"], "/usr/bin/java")
             self.assertEqual(metadata.st_uid, path.stat().st_uid)
             self.assertNotIn("MC_RCON_PASSWORD_FILE", settings)
+            self.assertNotIn("MC_BACKUP_DIRECTORY", settings)
+            self.assertEqual(settings["MC_IDLE_TIMEOUT"], "15m")
 
     def test_installer_requires_password_private_permissions_and_fixed_topology(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -150,39 +149,21 @@ class InstallerValidationTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
                 install.network_settings({**settings, **invalid})
 
-    @unittest.skipUnless(shutil.which("tar") and shutil.which("zstd"), "requires tar and zstd")
-    def test_full_server_backup_verifies_custom_world_and_detects_damage(self):
+    def test_server_directory_is_validated_without_reading_world_contents(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            server, backup = base / "server", base / "backup"
+            server = Path(temporary) / "server"
             server.mkdir()
-            backup.mkdir()
-            original = b"level-name=custom world\nonline-mode=true\n"
-            (server / "server.properties").write_bytes(original)
             world = server / "custom world"
             world.mkdir()
-            (world / "level.dat").write_bytes(b"test-only synthetic world data")
-            (server / "mods").mkdir()
-            (server / "mods" / "example.jar").write_bytes(b"synthetic mod bytes")
-            archive = backup / "server-before-bootloader.tar.zst"
-            subprocess.run([shutil.which("tar"), "--zstd", "--create", "--file", str(archive),
-                            "--directory", str(server), "."], check=True, capture_output=True)
-            (backup / "server.properties").write_bytes(original)
-            manifest = {"format": 1, "server_directory": str(server),
-                        "archive_sha256": install.sha256_file(archive),
-                        "properties_sha256": hashlib.sha256(original).hexdigest()}
-            (backup / "backup.json").write_text(json.dumps(manifest))
-            self.assertEqual(install.verify_backup(backup, server, original), archive)
-            with self.assertRaisesRegex(RuntimeError, "different server"):
-                install.verify_backup(backup, base / "different", original)
-            with self.assertRaisesRegex(RuntimeError, "properties differ"):
-                install.verify_backup(backup, server, original + b"changed=true\n")
-            archive.write_bytes(archive.read_bytes()[:-1] + b"broken")
-            with self.assertRaisesRegex(RuntimeError, "checksum"):
-                install.verify_backup(backup, server, original)
-            self.assertEqual((world / "level.dat").read_bytes(), b"test-only synthetic world data")
-
-
+            data = b"valuable synthetic world data"
+            (world / "level.dat").write_bytes(data)
+            self.assertEqual(install.server_directory({"MC_SERVER_DIRECTORY": str(server)}), server)
+            self.assertEqual((world / "level.dat").read_bytes(), data)
+            for path in ("relative", "/", str(world / "level.dat")):
+                with self.subTest(path=path), self.assertRaises(RuntimeError):
+                    install.server_directory({"MC_SERVER_DIRECTORY": path})
+            with self.assertRaises(FileNotFoundError):
+                install.server_directory({"MC_SERVER_DIRECTORY": str(server / "missing")})
 
 
 if __name__ == "__main__":

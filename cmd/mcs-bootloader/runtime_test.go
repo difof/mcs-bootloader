@@ -820,7 +820,8 @@ func TestBackendStopReadsAppliedConfigBeforeInvalidPendingFile(t *testing.T) {
 	}
 	// PID 1 is rejected by the helper without sending a stop. Reaching that
 	// validation proves pending broken .env did not mask the applied snapshot.
-	err := run([]string{"backend-stop", "--socket", f.socket, "--config", f.m.path, "--pid", "1"})
+	cfg, _ := f.m.snapshot()
+	err := runBackendInService(cliOptions{Command: "backend-stop", Socket: f.socket, Env: f.m.path, PID: "1"}, fixtureBackendServiceContext(cfg.Service))
 	if err == nil || !strings.Contains(err.Error(), "valid --pid") {
 		t.Fatalf("applied backend config was not used: %v", err)
 	}

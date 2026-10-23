@@ -81,7 +81,7 @@ func LoadEnv(data []byte) (Config, error) {
 	taskFields := map[string]bool{
 		"MC_BINARY": true, "MC_CONFIG": true, "MC_SERVICE_USER": true,
 		"MC_GATEWAY_SERVICE": true, "MC_LOG_NAMESPACE": true,
-		"MC_COMMAND_TIMEOUT": true, "MC_BACKUP_DIRECTORY": true,
+		"MC_COMMAND_TIMEOUT": true,
 	}
 	seen := make(map[string]bool)
 	for lineIndex, line := range strings.Split(string(data), "\n") {

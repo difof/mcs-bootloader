@@ -20,7 +20,6 @@ var helpCommands = []helpCommand{
 	{"config check", "Validate .env syntax, values and private file permissions."},
 	{"config live", "Show the gateway's currently applied settings (redacted)."},
 	{"config reload [PATH]", "Apply live .env changes atomically through the control socket."},
-	{"backup", "Create and verify a full backup before first installation."},
 	{"install [--report PATH]", "Install this executable, service units and the private configuration."},
 	{"deploy", "Replace the installed executable atomically, retaining the previous binary."},
 	{"remove [--dry-run | --yes]", "Preview removal; --yes removes owned service files with Minecraft stopped, preserving data."},

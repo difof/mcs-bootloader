@@ -31,7 +31,8 @@ tasks:
       - task: test
       - python3 -m unittest discover -s scripts -p 'test_*.py'
   build:
-    desc: Build the standalone daemon and operator CLI
+    desc: Build the current standalone binary, reusing the Go compiler cache
+    silent: true
     cmds:
       - mkdir -p bin
       - go build -trimpath -ldflags {{printf "-s -w -X main.version=%s" .VERSION | shellQuote}} -o bin/mcs-bootloader ./cmd/mcs-bootloader
@@ -39,258 +40,230 @@ tasks:
     desc: Fuzz handshake framing for 10 seconds
     cmds:
       - go test ./internal/mcproto -run '^$' -fuzz '^FuzzReadHandshake$' -fuzztime=10s -parallel=2
-  install:
-    desc: Check/build, then install against a stopped and backed-up server
-    cmds:
-      - task: check
-      - task: build
-      - task: install:binary
-  deploy:
-    desc: Check/build, then atomically install an update; restart explicitly
-    cmds:
-      - task: check
-      - task: build
-      - task: deploy:binary
   release:package:
-    desc: 'Check/build standalone release binaries locally: task release:package VERSION=v0.5.0 (never publishes)'
+    desc: 'Build checked release binaries locally: task release:package VERSION=v0.5.0 (never publishes)'
     preconditions:
       - sh: python3 scripts/release.py check-version --version {{.VERSION | shellQuote}}
         msg: Supply a stable semantic version such as VERSION=v0.5.0
     cmds:
       - task: check
       - python3 scripts/release.py package --version {{.VERSION | shellQuote}}
+
+  # Every operator task builds first; Go caches unchanged packages.
+  # Never interpolate CLI_ARGS: the binary recovers literal Task argv.
   cli:
-    desc: 'Run any binary command: task cli -- config show --json'
+    desc: 'Run any command: task cli -- config show --json'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task
-  install:binary:
-    desc: 'Install using the built executable and its embedded assets'
+  help:
+    desc: 'Show CLI help: task help -- command'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task help
+  serve:
+    desc: 'Run the gateway in the foreground; normally use its service'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task serve
+  install:
+    aliases: [install:binary]
+    desc: 'Build and install this executable with its embedded assets'
+    silent: true
+    cmds:
+      - task: build
       - ./bin/mcs-bootloader _task install
-  backup:
-    desc: 'Create and verify a complete first-install backup while Minecraft is stopped'
+  deploy:
+    aliases: [deploy:binary]
+    desc: 'Build and atomically deploy; leave running processes untouched'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - ./bin/mcs-bootloader _task backup
-  deploy:binary:
-    desc: 'Atomically deploy the built executable; leave running processes untouched'
-    silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
-    cmds:
+      - task: build
       - ./bin/mcs-bootloader _task deploy
   remove:
-    desc: 'Preview removal; pass -- --yes to remove owned service files, retaining server and config'
+    desc: 'Preview removal; pass -- --yes to remove owned files, retaining server and config'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task remove
   status:
-    desc: 'Show state, players, connections and version'
+    desc: 'Show state, players, connections and running version'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task status
   stats:
-    desc: 'Show cached telemetry as a readable summary'
+    desc: 'Show cached telemetry, uptime and boot estimates'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task stats
   version:
-    desc: 'Show the built executable version; status shows the running daemon version'
+    desc: 'Show source binary version; status shows the running gateway version'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task version
   metrics:
     desc: 'Inspect cached metrics; use -- --raw for Prometheus or -- --json'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task metrics
   start:
     aliases: [wake]
     desc: 'Wake Minecraft once; joining also wakes it automatically'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task start
   stop:
     aliases: [sleep]
     desc: 'Save and stop only when empty; refuse active players or joins'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task stop
   command:
     desc: 'Send a console command: task command -- op PlayerName'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task command
   logs:
     desc: 'Show recent gateway events'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task logs
   logs:follow:
     desc: 'Follow gateway events; Ctrl+C exits the viewer'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task logs --follow
   logs:server:
     desc: 'Show recent Minecraft console output'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task logs --server
   logs:server:follow:
     desc: 'Follow Minecraft console output'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task logs --server --follow
-  config:new:
+  init:
     desc: 'Create a private .env with a random RCON password; never overwrite'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - ./bin/mcs-bootloader _task config new
-  init:
-    desc: 'Create the initial private configuration from embedded defaults'
-    silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
-    cmds:
+      - task: build
       - ./bin/mcs-bootloader _task init
-  config:init:
-    desc: 'Link local .env to the installed canonical configuration'
+  config:
+    desc: 'Configuration command group: task config -- show'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task config
+  config:new:
+    desc: 'Create a new private configuration from embedded defaults'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task config new
+  config:link:
+    aliases: [config:init]
+    desc: 'Link a local .env to the installed canonical configuration'
+    silent: true
+    cmds:
+      - task: build
       - ./bin/mcs-bootloader _task config link
   config:edit:
-    desc: 'Edit the canonical .env using VISUAL, EDITOR or nano'
+    desc: 'Edit the resolved .env using VISUAL, EDITOR or nano'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task config edit
   config:show:
     desc: 'Show desired settings with the password redacted'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task config show
   config:live:
     desc: 'Show applied settings with the password redacted'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task config live
   config:check:
     desc: 'Validate settings and service-account access'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task config check
   config:reload:
-    aliases: [reload]
+    aliases: [reload, config:apply]
     desc: 'Atomically re-read .env over the socket: task config:reload -- .env'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task config reload
-  config:apply:
-    desc: 'Compatibility alias for config:reload'
+  gateway:
+    desc: 'Gateway command group: task gateway -- restart'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
-      - ./bin/mcs-bootloader _task config reload
+      - task: build
+      - ./bin/mcs-bootloader _task gateway
   gateway:start:
     desc: 'Start the gateway and wake monitoring'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task gateway start
   gateway:configure:
     desc: 'Refresh gateway service settings without restarting processes'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task gateway configure
   gateway:stop:
     desc: 'Stop public access and wake monitoring; Java stays running'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task gateway stop
   gateway:restart:
     desc: 'Restart the gateway after preflight; disconnect clients, keep Java running'
     silent: true
-    preconditions:
-      - sh: test -x ./bin/mcs-bootloader
-        msg: Run task build first; operator tasks call the built executable.
     cmds:
+      - task: build
       - ./bin/mcs-bootloader _task gateway restart
+  config:validate:
+    desc: 'Internal config validation helper; normally use config:check'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task check
+  restart-check:
+    desc: 'Internal restart preflight; normally use gateway:restart'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task restart-check
+  backend-start:
+    desc: 'Systemd launch helper; normally use start'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task backend-start
+  backend-stop:
+    desc: 'Systemd stop helper with --pid; normally use stop'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task backend-stop
