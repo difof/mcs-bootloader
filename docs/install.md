@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- An existing working Minecraft Java server and the Java/runtime required by its modpack.
+- An existing working [supported Minecraft Java server](compatibility.md) and the Java/runtime required by its modpack.
 - Linux with systemd, journald namespaces, `systemctl`, `systemd-analyze`, `journalctl` and `busctl`.
 - Python **3.10+**, `sudo`/`visudo`, `runuser`, `getconf`, and standard core utilities. `sha256sum` is useful for checking the downloaded release, not a runtime dependency. No archive/compression tools are required.
 - An existing non-root account owning the server and an operator with sudo access. Run `sudo -v` if you need to authenticate; subsequent tool operations use noninteractive sudo.
@@ -28,8 +28,12 @@ MC_SERVICE_USER=minecraft
 MC_SERVER_DIRECTORY=/srv/minecraft
 MC_LAUNCH_EXECUTABLE=/usr/bin/java
 MC_LAUNCH_ARGS='["-Xms2G","-Xmx6G","-jar","server.jar","nogui"]'
+MC_PROTOCOL=767
+MC_VERSION=1.21.1
 MC_IDLE_TIMEOUT=15m
 ```
+
+Match the protocol/version to your backend; see the [compatibility table](compatibility.md#supported-versions).
 
 Choose your public/backend/RCON addresses before installation. The defaults are `:25565`, `127.0.0.1:25566` and `127.0.0.1:25575`; backend and RCON must use the same numeric loopback host and different ports.
 

@@ -69,13 +69,17 @@ func playerPoints(text string, details bool) ([]point, error) {
 	if err != nil {
 		return nil, err
 	}
+	return playerListPoints(count, capacity, players, details), nil
+}
+
+func playerListPoints(count, capacity int, players []player, details bool) []point {
 	points := []point{gauge("mcs_minecraft_players_online", "Online players reported by native RCON list.", float64(count)), gauge("mcs_minecraft_players_capacity", "Player capacity reported by native RCON list.", float64(capacity))}
 	if details {
 		for _, p := range players {
 			points = append(points, gauge("mcs_minecraft_player_online", "Online player from native list uuids; enabled only with player details.", 1, "name", p.Name, "uuid", p.UUID))
 		}
 	}
-	return points, nil
+	return points
 }
 
 func tickPoints(text string) ([]point, error) {

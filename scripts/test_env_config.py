@@ -231,6 +231,18 @@ class EnvConfigTests(unittest.TestCase):
                 env_config.validate_values({"MC_LOG_LINES": value})
         self.assertEqual(env_config.validate_values({"MC_PROTOCOL": "767"}), {"MC_PROTOCOL": 767})
 
+    def test_protocol_allowlist_matches_go_and_rejects_unknown_versions(self):
+        source = (ROOT / "internal/mcproto/version.go").read_text()
+        match = re.search(r"var supportedProtocols = \[\.\.\.\]int\{(.*?)\n\}", source, re.DOTALL)
+        self.assertIsNotNone(match)
+        protocols = {int(value) for value in re.findall(r"\d+", match.group(1))}
+        self.assertEqual(protocols, env_config.SUPPORTED_PROTOCOLS)
+        for protocol in (5, 340, 759, 760, 763, 767, 775):
+            self.assertEqual(self.read(f"MC_PROTOCOL={protocol}\n"), {"MC_PROTOCOL": protocol})
+        for protocol in (4, 6, 999, (1 << 30) | 256):
+            with self.subTest(protocol=protocol), self.assertRaisesRegex(env_config.EnvConfigError, "unsupported protocol"):
+                self.read(f"MC_PROTOCOL={protocol}\n")
+
     def test_validation_rejects_unknown_keys_and_nonstring_data(self):
         for values in (None, [], {"MC_UNKNOWN": "value"}, {"PATH": "value"},
                        {1: "value"}, {"MC_VERSION": None}, {"MC_VERSION": 767},

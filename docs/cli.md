@@ -36,6 +36,7 @@ The password is redacted in all configuration output. Put CLI flags before the f
 | `logs [--server] [--follow] [--lines N]` | Gateway events or Minecraft console output; Ctrl+C exits the viewer. |
 | `metrics [--raw]` | Cached metric table; `--raw` prints Prometheus text, `--json` gives structured samples. |
 | `serve` | Run the gateway in the foreground; normally systemd owns this process. |
+| `license` | Print the embedded AGPL-3.0-only text; `--json` includes the SPDX identifier and full text. |
 | `version` / `help` | Executable version / command help. `status` reports the running daemon version. |
 
 ## Minecraft console
@@ -66,7 +67,7 @@ Use Go 1.24+, Python 3.10+, Task 3, and a C compiler for race tests. Run from th
 | `task command -- op PlayerName` | `command -- op PlayerName` |
 | `task logs`, `logs:follow`, `logs:server`, `logs:server:follow` | `logs` with the corresponding flags |
 | `task gateway:start`, `gateway:stop`, `gateway:restart`, `gateway:configure` | Corresponding `gateway` subcommand |
-| `task help`, `serve`, `version` | Same command |
+| `task help`, `serve`, `version`, `license` | Same command |
 | `task config -- show`, `task gateway -- restart` | Command-group access |
 | `task cli -- <arguments>` | Any CLI operation, flags or aliases |
 

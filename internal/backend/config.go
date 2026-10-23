@@ -1,23 +1,12 @@
 package backend
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"maps"
-	"net"
-	"net/netip"
-	"os"
-	"path/filepath"
-	"regexp"
 	"slices"
-	"strconv"
-	"strings"
-	"syscall"
 	"time"
-	"unicode/utf8"
 )
 
 type Duration time.Duration
@@ -105,193 +94,11 @@ func DefaultConfig() Config {
 	}
 }
 
-func LoadConfig(path string) (Config, error) {
-	c := DefaultConfig()
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return c, err
-	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil {
-		return c, fmt.Errorf("inspect configuration file: %w", err)
-	}
-	if !stat.Mode().IsRegular() {
-		return c, fmt.Errorf("configuration file must be a regular file")
-	}
-	raw, err := io.ReadAll(io.LimitReader(f, 65537))
-	if err != nil {
-		return c, err
-	}
-	if len(raw) > 65536 {
-		return c, fmt.Errorf("configuration exceeds 64 KiB")
-	}
-	if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
-		if stat.Mode().Perm() != 0600 && stat.Mode().Perm() != 0640 {
-			return c, fmt.Errorf(".env must have private 0600 or 0640 permissions")
-		}
-		return LoadEnv(raw)
-	}
-	// JSON is accepted only to migrate older installations. The file name is
-	// deliberately irrelevant: reload validates temporary .env snapshots.
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if err := d.Decode(&c); err != nil {
-		return c, fmt.Errorf("configuration must be a JSON object with supported fields and value types")
-	}
-	if err := d.Decode(new(any)); err != io.EOF {
-		return c, fmt.Errorf("configuration has trailing data")
-	}
-	return c, c.Validate()
-}
-
-var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@:-]*\.service$`)
-
-func (c Config) Validate() error {
-	_, listenPort, err := net.SplitHostPort(c.Listen)
-	if err != nil {
-		return fmt.Errorf("listen address must contain a valid host and port")
-	}
-	if !validPort(listenPort) {
-		return fmt.Errorf("invalid listen port")
-	}
-	listenNumber, _ := strconv.Atoi(listenPort)
-	ports := map[int]bool{listenNumber: true}
-	for _, address := range []string{c.BackendAddress, c.RCONAddress} {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return fmt.Errorf("backend and RCON addresses must contain a valid host and port")
-		}
-		ip, err := netip.ParseAddr(host)
-		if err != nil || !ip.IsLoopback() {
-			return fmt.Errorf("backend and RCON addresses must be numeric loopback addresses")
-		}
-		portNumber, _ := strconv.Atoi(port)
-		if !validPort(port) || ports[portNumber] {
-			return fmt.Errorf("listen, backend, and RCON need distinct valid ports")
-		}
-		ports[portNumber] = true
-	}
-	if !servicePattern.MatchString(c.Service) {
-		return fmt.Errorf("invalid backend service name")
-	}
-	paths := []string{c.StateDirectory, c.AdminSocket, c.ServerDirectory}
-	if c.RCONPassword != "" {
-		if err := validatePassword(c.RCONPassword); err != nil {
-			return err
-		}
-	} else {
-		paths = append(paths, c.RCONPasswordFile)
-	}
-	for _, path := range paths {
-		if !filepath.IsAbs(path) || filepath.Clean(path) == "/" {
-			return fmt.Errorf("runtime paths must be absolute and non-root")
-		}
-		if strings.ContainsAny(path, "\x00\r\n") {
-			return fmt.Errorf("runtime paths must not contain NUL or line breaks")
-		}
-	}
-	if err := c.validateLaunch(); err != nil {
-		return err
-	}
-	if c.Protocol != 767 {
-		return fmt.Errorf("this release supports Minecraft 1.21.1 protocol 767; other versions require compatibility tests")
-	}
-	if c.MaxConnections < 1 || c.MaxConnections > 4096 || c.MaxPlayers < 1 {
-		return fmt.Errorf("invalid connection/player limit")
-	}
-	metricsHost, metricsPort, metricsErr := net.SplitHostPort(c.MetricsListen)
-	if metricsErr != nil || metricsHost == "" || !validPort(metricsPort) {
-		return fmt.Errorf("metrics_listen must contain a numeric IP address and valid port")
-	}
-	if _, err := netip.ParseAddr(metricsHost); err != nil {
-		return fmt.Errorf("metrics_listen must contain a numeric IP address")
-	}
-	metricsNumber, _ := strconv.Atoi(metricsPort)
-	if c.MetricsEnabled && ports[metricsNumber] {
-		return fmt.Errorf("enabled metrics must use a different port from the gateway, backend and RCON")
-	}
-	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "poll_interval": c.PollInterval, "operation_timeout": c.OperationTimeout, "startup_timeout": c.StartupTimeout, "shutdown_warn_after": c.ShutdownWarnAfter, "wake_cooldown": c.WakeCooldown, "handshake_timeout": c.HandshakeTimeout, "dial_timeout": c.DialTimeout, "restart_grace": c.RestartGrace, "metrics_poll_interval": c.MetricsPollInterval, "metrics_player_interval": c.MetricsPlayerInterval, "metrics_directory_interval": c.MetricsDirectoryInterval, "metrics_directory_timeout": c.MetricsDirectoryTimeout} {
-		if d <= 0 {
-			return fmt.Errorf("%s must be positive", name)
-		}
-	}
-	if err := ValidateMetricsDirectories(c.MetricsDirectories); err != nil {
-		return err
-	}
-	if c.PollInterval > c.IdleTimeout {
-		return fmt.Errorf("poll_interval must not exceed idle_timeout")
-	}
-	if c.LogLevel != "info" && c.LogLevel != "debug" && c.LogLevel != "warn" {
-		return fmt.Errorf("log_level must be info, warn, or debug")
-	}
-	for _, message := range []string{c.BootMessage, c.SleepingMOTD, c.StartingMOTD, c.StoppingMOTD, c.UnknownMOTD, c.FailedMOTD, c.MOTD, c.RestartMessage, c.WhitelistMessage} {
-		if len(message) == 0 || len(message) > 4096 || !utf8.ValidString(message) || strings.ContainsAny(message, "\x00\r") {
-			return fmt.Errorf("messages must contain 1-4096 bytes")
-		}
-	}
-	if strings.Contains(c.RestartMessage, "\n") {
-		return fmt.Errorf("restart_message must be a single line")
-	}
-	return nil
-}
-
 // Clone keeps each applied configuration snapshot independent of callers.
 func (c Config) Clone() Config {
 	c.LaunchArgs = slices.Clone(c.LaunchArgs)
 	c.MetricsDirectories = maps.Clone(c.MetricsDirectories)
 	return c
-}
-
-const maxLaunchArgs = 256
-const maxLaunchBytes = 32768
-
-func (c Config) validateLaunch() error {
-	if strings.TrimSpace(c.LaunchExecutable) == "" || len(c.LaunchExecutable) > 4096 ||
-		strings.ContainsAny(c.LaunchExecutable, "\x00\r\n") || !utf8.ValidString(c.LaunchExecutable) {
-		return fmt.Errorf("MC_LAUNCH_EXECUTABLE must be a nonempty valid UTF-8 path of at most 4096 bytes without NUL or line breaks")
-	}
-	if c.LaunchArgs == nil || len(c.LaunchArgs) > maxLaunchArgs {
-		return fmt.Errorf("MC_LAUNCH_ARGS must be a JSON array containing at most 256 strings")
-	}
-	total := 0
-	for _, arg := range c.LaunchArgs {
-		total += len(arg)
-		if strings.ContainsAny(arg, "\x00\r\n") || !utf8.ValidString(arg) {
-			return fmt.Errorf("MC_LAUNCH_ARGS strings must contain valid UTF-8 without NUL or line breaks")
-		}
-	}
-	if total > maxLaunchBytes {
-		return fmt.Errorf("MC_LAUNCH_ARGS must contain at most 32768 UTF-8 bytes in total")
-	}
-	return nil
-}
-
-func validPort(s string) bool {
-	n, e := strconv.Atoi(s)
-	return decimalDigits(s) && e == nil && n > 0 && n <= 65535
-}
-
-// Password preserves inline credentials exactly. ReadPassword is retained only
-// for older JSON configurations while an installation is being migrated.
-func (c Config) Password() (string, error) {
-	if c.RCONPassword != "" {
-		if err := validatePassword(c.RCONPassword); err != nil {
-			return "", err
-		}
-		return c.RCONPassword, nil
-	}
-	if c.RCONPasswordFile == "" {
-		return "", fmt.Errorf("MC_RCON_PASSWORD is required")
-	}
-	return ReadPassword(c.RCONPasswordFile)
-}
-
-func validatePassword(password string) error {
-	if len(password) < 16 || len(password) > 4096 || strings.ContainsAny(password, "\x00\r\n") {
-		return fmt.Errorf("RCON password must be 16-4096 bytes without line breaks or NUL")
-	}
-	return nil
 }
 
 // String and LogValue also guard against accidental logging with fmt or slog.
@@ -308,46 +115,3 @@ func (c Config) String() string {
 func (c Config) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 func (c Config) GoString() string { return c.String() }
-
-func ReadPassword(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open RCON password file: %w", err)
-	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if !stat.Mode().IsRegular() || stat.Mode().Perm()&0027 != 0 {
-		return "", fmt.Errorf("RCON password file must be regular, not group-writable or accessible to other users (0600/0640)")
-	}
-	data, err := io.ReadAll(io.LimitReader(f, 4097))
-	if err != nil {
-		return "", err
-	}
-	password := strings.TrimSpace(string(data))
-	if len(password) < 16 || len(data) > 4096 || strings.ContainsAny(password, "\x00\r\n") {
-		return "", fmt.Errorf("RCON password must be 16-4096 bytes without line breaks or NUL")
-	}
-	return password, nil
-}
-
-// Directory labels are operator-chosen names, never arbitrary discovered paths.
-// The count/path limits bound configuration and Prometheus label cardinality.
-var metricsDirectoryName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`)
-
-func ValidateMetricsDirectories(directories map[string]string) error {
-	if len(directories) > 32 {
-		return fmt.Errorf("MC_METRICS_DIRECTORIES supports at most 32 named directories")
-	}
-	for name, path := range directories {
-		if !metricsDirectoryName.MatchString(name) {
-			return fmt.Errorf("MC_METRICS_DIRECTORIES names must start with a letter and contain at most 64 ASCII letters, digits, dots, underscores or hyphens")
-		}
-		if !filepath.IsAbs(path) || filepath.Clean(path) == "/" || len(path) > 4096 || !utf8.ValidString(path) || strings.ContainsAny(path, "\x00\r\n") {
-			return fmt.Errorf("MC_METRICS_DIRECTORIES values must be absolute non-root paths of at most 4096 UTF-8 bytes without NUL or line breaks")
-		}
-	}
-	return nil
-}

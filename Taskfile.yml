@@ -107,6 +107,12 @@ tasks:
     cmds:
       - task: build
       - ./bin/mcs-bootloader _task version
+  license:
+    desc: 'Show the embedded AGPL-3.0-only license'
+    silent: true
+    cmds:
+      - task: build
+      - ./bin/mcs-bootloader _task license
   metrics:
     desc: 'Inspect cached metrics; use -- --raw for Prometheus or -- --json'
     silent: true

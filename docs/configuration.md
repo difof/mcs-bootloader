@@ -24,6 +24,10 @@ Files are data: `KEY=value`, comments, single-quoted literals and JSON double-qu
 
 The default `MC_IDLE_TIMEOUT=15m` means 15 minutes of confirmed emptiness. Keep `MC_POLL_INTERVAL` at or below the idle timeout. Durations use explicit units (`15m`, `30s`, `500ms`).
 
+## Minecraft version
+
+Set `MC_PROTOCOL` and `MC_VERSION` to the existing backend. The default remains 1.21.1 / 767; the finite stable-version allowlist covers Java 1.7.10 through 26.1.2. See [Compatibility](compatibility.md) for protocol numbers and the distinction between envelope fixtures and real modpack verification.
+
 ## Startup estimate
 
 ```dotenv

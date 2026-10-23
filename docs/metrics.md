@@ -36,7 +36,7 @@ Use the gateway host's reachable address if Prometheus runs elsewhere. The endpo
 - Collection cycles do not overlap. The configured poll interval is the wait after a collection completes. No per-scrape or successful-poll log messages are emitted; failures appear in bounded counters and availability gauges.
 - `getconf CLK_TCK` provides the Linux process clock scale once when metrics start. HotSpot collection uses `/proc/<pid>/root/tmp/hsperfdata_*/<pid>`, so a systemd private `/tmp` does not require namespace changes. The gateway needs permission to inspect its configured Java process; using the same OS account provides that on a normal Linux installation.
 
-Native RCON text parsers target the standard English Java server responses, including the tested Minecraft1.21.1 forms. A mod or different version may return unsupported output. That collector becomes unavailable; gameplay and sleep/wake control continue independently. No JVM arguments, JMX agent, Minecraft mods or world files are changed for monitoring.
+Lifecycle player counts support the three standard English response formats used across the supported Java versions. Optional telemetry parsers target modern native commands, including tested Minecraft 1.21.1 forms. Older servers or mods may lack `list uuids`, `tick query`, or player-NBT commands, or return unsupported output. That collector becomes unavailable; gameplay and lifecycle polling continue independently. See [Compatibility](compatibility.md). No JVM arguments, JMX agent, Minecraft mods or world files are changed for monitoring.
 
 ## Availability and freshness
 

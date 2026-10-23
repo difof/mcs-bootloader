@@ -27,7 +27,7 @@ SOURCE_SUFFIXES = {
     ".github": {".yml", ".yaml"},
 }
 REQUIRED_FILES = frozenset({
-    "README.md", "AGENTS.md", "Taskfile.yml", ".env.example", "go.mod", "assets.go",
+    "README.md", "AGENTS.md", "Taskfile.yml", ".env.example", "go.mod", "assets.go", "LICENSE",
     "scripts/install.py", "scripts/manage.py", "scripts/env_config.py", "scripts/service_config.py", "scripts/remove.py",
     "deploy/mcs-bootloader.service", "deploy/mcs-bootloader-backend.service",
     "deploy/journald@mcs-bootloader.conf",
@@ -148,6 +148,7 @@ def package(version, root=ROOT):
         "commit_timestamp": epoch, "go_toolchain": run(["go", "version"], root=root),
         "targets": ["linux/amd64", "linux/arm64"], "cgo_enabled": False,
         "distribution": "standalone-binary", "operator_assets": "embedded",
+        "license": "AGPL-3.0-only",
     }
     repository = os.environ.get("GITHUB_REPOSITORY", "difof/mcs-bootloader")
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:

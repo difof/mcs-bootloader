@@ -6,6 +6,7 @@ files. Activation failures retain the validated installation for inspection: a
 backend might already be starting, so automatic world/config rollback is unsafe.
 """
 
+from dataclasses import dataclass
 import datetime
 import errno
 import grp
@@ -238,22 +239,54 @@ def server_directory(settings):
     return server
 
 
-def install(env_path, report_path, *, binary_path):
-    require(os.geteuid() == 0, "installer must run as root")
-    settings, original_env, env_metadata = installation_settings(env_path)
+@dataclass(frozen=True)
+class OriginalFile:
+    path: Path
+    data: bytes
+    metadata: os.stat_result
+
+    def restore(self):
+        info = self.metadata
+        write_atomic(self.path, self.data, stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+        os.utime(self.path, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+
+@dataclass(frozen=True)
+class InstallationPlan:
+    settings: dict
+    source_env: OriginalFile
+    properties: OriginalFile
+    report_path: Path
+    user: str
+    account: pwd.struct_passwd
+    group: str
+    server: Path
+    roots: list
+    targets: list
+    replacement: bytes
+    binary: bytes
+
+
+def installation_account(settings):
     user = safe_text(settings["MC_SERVICE_USER"])
     require(re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", user) is not None, "unsupported account name")
     account = pwd.getpwnam(user)
     require(account.pw_uid != 0, "the gateway must not run as root")
     group = grp.getgrgid(account.pw_gid).gr_name
     require(re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", group) is not None, "unsupported group name")
-    server = server_directory(settings)
-    executable = launch_executable(server, settings["MC_LAUNCH_EXECUTABLE"])
+    return user, account, group
+
+
+def original_properties(server, account):
     props = server / "server.properties"
     require(props.is_file() and not props.is_symlink(), "server.properties must be an ordinary file")
     metadata = props.stat()
     original = props.read_bytes()
     require(metadata.st_uid == account.pw_uid, "server.properties is not owned by the selected service account")
+    return OriginalFile(props, original, metadata)
+
+
+def installation_paths(report_path):
     require(not os.path.lexists(report_path), "installation report already exists; this is a first-install operation")
     require(report_path.parent.is_dir(), "installation report directory must already exist")
     for directory in ("/opt", "/etc", "/etc/systemd/system", "/etc/sudoers.d", "/var/lib"):
@@ -268,123 +301,196 @@ def install(env_path, report_path, *, binary_path):
     for unit in ("mcs-bootloader.service", "mcs-bootloader-backend.service"):
         state = run(["/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value"], allowed=(0, 1))
         require(state == "not-found", f"refusing existing or uninspectable unit: {unit} ({state})")
+    return roots, targets
+
+
+def prepare_installation(env_path, report_path, binary_path):
+    require(os.geteuid() == 0, "installer must run as root")
+    settings, raw, metadata = installation_settings(env_path)
+    source_env = OriginalFile(env_path, raw, metadata)
+    user, account, group = installation_account(settings)
+    server = server_directory(settings)
+    executable = launch_executable(server, settings["MC_LAUNCH_EXECUTABLE"])
+    properties = original_properties(server, account)
+    roots, targets = installation_paths(report_path)
     stopped_and_ports_free(account.pw_uid, settings, server)
     for path, permission in ((server, "-w"), (executable, "-x")):
         run(["/usr/sbin/runuser", "-u", user, "--", "/usr/bin/test", permission, str(path)])
-    password = settings["MC_RCON_PASSWORD"]
-    replacement = updated_properties(original, password, settings["MC_BACKEND_ADDRESS"], settings["MC_RCON_ADDRESS"])
-    source_binary = Path(binary_path)
-    binary = source_binary.read_bytes()
+    replacement = updated_properties(properties.data, settings["MC_RCON_PASSWORD"],
+                                     settings["MC_BACKEND_ADDRESS"], settings["MC_RCON_ADDRESS"])
+    binary = Path(binary_path).read_bytes()
     require(binary.startswith(b"\x7fELF"), "the installation source is not a Linux executable")
-    created, directories, changed_props, reloaded, linked_env = [], [], False, False, False
-    report = {"created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "validating",
-              "user": user, "server_directory": str(server),
-              "configuration": "/etc/mcs-bootloader/.env", "project_env": str(env_path),
-              "operator_uid": env_metadata.st_uid,
-              "original_properties": {"sha256": hashlib.sha256(original).hexdigest(),
-                                      "uid": metadata.st_uid, "gid": metadata.st_gid,
-                                      "mode": oct(stat.S_IMODE(metadata.st_mode)),
-                                      "atime_ns": metadata.st_atime_ns, "mtime_ns": metadata.st_mtime_ns},
-              "binary_sha256": hashlib.sha256(binary).hexdigest(), "phase": "install files"}
+    return InstallationPlan(settings, source_env, properties, report_path, user, account,
+                            group, server, roots, targets, replacement, binary)
 
-    def save_report():
-        write_atomic(report_path, (json.dumps(report, indent=2) + "\n").encode(), 0o600,
-                     report_path.parent.stat().st_uid, report_path.parent.stat().st_gid)
 
-    def add_file(path, data, mode=0o644, gid=0, uid=0):
+def installation_report(plan):
+    metadata = plan.properties.metadata
+    return {"created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "validating",
+            "user": plan.user, "server_directory": str(plan.server),
+            "configuration": "/etc/mcs-bootloader/.env", "project_env": str(plan.source_env.path),
+            "operator_uid": plan.source_env.metadata.st_uid,
+            "original_properties": {"sha256": hashlib.sha256(plan.properties.data).hexdigest(),
+                                    "uid": metadata.st_uid, "gid": metadata.st_gid,
+                                    "mode": oct(stat.S_IMODE(metadata.st_mode)),
+                                    "atime_ns": metadata.st_atime_ns, "mtime_ns": metadata.st_mtime_ns},
+            "binary_sha256": hashlib.sha256(plan.binary).hexdigest(), "phase": "install files"}
+
+
+class InstallationTransaction:
+    """Track only this invocation's tool files and reversible pre-activation edits."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.report = installation_report(plan)
+        self.created = []
+        self.directories = []
+        self.changed_props = False
+        self.reloaded = False
+        self.linked_env = False
+
+    def save_report(self):
+        path = self.plan.report_path
+        write_atomic(path, (json.dumps(self.report, indent=2) + "\n").encode(), 0o600,
+                     path.parent.stat().st_uid, path.parent.stat().st_gid)
+
+    def add_file(self, path, data, mode=0o644, gid=0, uid=0):
         require(not os.path.lexists(path), f"installation path appeared concurrently: {path}")
         write_atomic(path, data, mode, uid, gid)
-        created.append(path)
+        self.created.append(path)
 
-    try:
-        for path, mode, uid, gid in ((roots[0], 0o755, 0, 0), (roots[0] / "bin", 0o755, 0, 0),
-                                     (roots[1], 0o2750, env_metadata.st_uid, account.pw_gid),
-                                     (roots[2], 0o700, account.pw_uid, account.pw_gid)):
+    def create_directories(self):
+        plan = self.plan
+        for path, mode, uid, gid in ((plan.roots[0], 0o755, 0, 0), (plan.roots[0] / "bin", 0o755, 0, 0),
+                                     (plan.roots[1], 0o2750, plan.source_env.metadata.st_uid, plan.account.pw_gid),
+                                     (plan.roots[2], 0o700, plan.account.pw_uid, plan.account.pw_gid)):
             path.mkdir(mode=mode)
-            directories.append(path)
+            self.directories.append(path)
             os.chown(path, uid, gid)
             os.chmod(path, mode)
-        add_file(roots[0] / "bin/mcs-bootloader", binary, 0o755)
-        add_file(roots[1] / ".env", original_env, 0o640, account.pw_gid, env_metadata.st_uid)
-        for destination in targets[:2]:
+
+    def install_service_files(self):
+        plan = self.plan
+        for destination in plan.targets[:2]:
             unit = (ROOT / "deploy" / destination.name).read_text()
             require(unit.count("User=minecraft\n") == 1 and unit.count("Group=minecraft\n") == 1,
                     "service template account markers changed; review installer")
-            unit = unit.replace("User=minecraft\n", f"User={user}\n").replace("Group=minecraft\n", f"Group={group}\n")
-            add_file(destination, unit.encode())
-        add_file(targets[2], (ROOT / "deploy/journald@mcs-bootloader.conf").read_bytes())
-        sudoers = f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl start mcs-bootloader-backend.service\n".encode()
+            unit = unit.replace("User=minecraft\n", f"User={plan.user}\n").replace("Group=minecraft\n", f"Group={plan.group}\n")
+            self.add_file(destination, unit.encode())
+        self.add_file(plan.targets[2], (ROOT / "deploy/journald@mcs-bootloader.conf").read_bytes())
+        sudoers = f"{plan.user} ALL=(root) NOPASSWD: /usr/bin/systemctl start mcs-bootloader-backend.service\n".encode()
         with tempfile.TemporaryDirectory(prefix="mcs-bootloader-sudoers-") as temporary:
             staged = Path(temporary) / "rule"
             staged.write_bytes(sudoers)
             staged.chmod(0o440)
             run(["/usr/sbin/visudo", "-cf", str(staged)])
-        add_file(targets[3], sudoers, 0o440)
-        report["phase"] = "validate installed units and configuration"
-        run(["/usr/bin/systemd-analyze", "verify", str(targets[0]), str(targets[1])])
-        run(["/usr/sbin/runuser", "-u", user, "--", str(roots[0] / "bin/mcs-bootloader"),
-             "check", "--config", str(roots[1] / ".env")])
-        report["phase"] = "update stopped server properties"
-        stopped_and_ports_free(account.pw_uid, settings, server)
-        require(props.read_bytes() == original, "server.properties changed during validation")
-        write_atomic(props, replacement, 0o640, metadata.st_uid, metadata.st_gid)
-        changed_props = True
-        report["properties_sha256"] = hashlib.sha256(replacement).hexdigest()
-        report["installed_files"] = [str(path) for path in created]
-        report["phase"] = "link shared configuration"
-        link_shared_env(env_path, roots[1] / ".env", original_env, env_metadata)
-        linked_env = True
-        report["phase"] = "reload validated units"
+        self.add_file(plan.targets[3], sudoers, 0o440)
+
+    def install_files(self):
+        plan = self.plan
+        self.create_directories()
+        self.add_file(plan.roots[0] / "bin/mcs-bootloader", plan.binary, 0o755)
+        self.add_file(plan.roots[1] / ".env", plan.source_env.data, 0o640,
+                      plan.account.pw_gid, plan.source_env.metadata.st_uid)
+        self.install_service_files()
+
+    def validate_installed_files(self):
+        plan = self.plan
+        self.report["phase"] = "validate installed units and configuration"
+        run(["/usr/bin/systemd-analyze", "verify", str(plan.targets[0]), str(plan.targets[1])])
+        run(["/usr/sbin/runuser", "-u", plan.user, "--", str(plan.roots[0] / "bin/mcs-bootloader"),
+             "check", "--config", str(plan.roots[1] / ".env")])
+
+    def update_properties(self):
+        plan = self.plan
+        self.report["phase"] = "update stopped server properties"
+        stopped_and_ports_free(plan.account.pw_uid, plan.settings, plan.server)
+        require(plan.properties.path.read_bytes() == plan.properties.data, "server.properties changed during validation")
+        metadata = plan.properties.metadata
+        write_atomic(plan.properties.path, plan.replacement, 0o640, metadata.st_uid, metadata.st_gid)
+        self.changed_props = True
+        self.report["properties_sha256"] = hashlib.sha256(plan.replacement).hexdigest()
+        self.report["installed_files"] = [str(path) for path in self.created]
+
+    def link_configuration(self):
+        plan = self.plan
+        self.report["phase"] = "link shared configuration"
+        link_shared_env(plan.source_env.path, plan.roots[1] / ".env",
+                        plan.source_env.data, plan.source_env.metadata)
+        self.linked_env = True
+
+    def activate(self):
+        plan = self.plan
+        self.report["phase"] = "reload validated units"
         run(["/usr/bin/systemctl", "daemon-reload"])
-        reloaded = True
-        stopped_and_ports_free(account.pw_uid, settings, server)
-        report["status"], report["phase"] = "validated", "before activation"
-        save_report()
-        report["phase"] = "activate gateway"
+        self.reloaded = True
+        stopped_and_ports_free(plan.account.pw_uid, plan.settings, plan.server)
+        self.report["status"], self.report["phase"] = "validated", "before activation"
+        self.save_report()
+        # A failed enable/start may already have started Minecraft. Keep the
+        # validated configuration from this point onward, including report errors.
+        self.report["phase"] = "activate gateway"
         run(["/usr/bin/systemctl", "enable", "--now", "mcs-bootloader.service"])
-        report["status"], report["phase"] = "installed", "complete"
-        save_report()
-        result = {"status": "installed", "gateway": "enabled", "backend": "not explicitly started or enabled",
-                  "report": str(report_path), "configuration": str(roots[1] / ".env")}
-        print(json.dumps(result))
-        return result
-    except Exception as exc:
-        failure_phase = report["phase"]
-        rollback_errors = []
-        if failure_phase != "activate gateway" and report["status"] != "installed":
-            if linked_env:
-                try:
-                    write_atomic(env_path, original_env, stat.S_IMODE(env_metadata.st_mode),
-                                 env_metadata.st_uid, env_metadata.st_gid)
-                    os.utime(env_path, ns=(env_metadata.st_atime_ns, env_metadata.st_mtime_ns))
-                except Exception as rollback:
-                    rollback_errors.append(f"restore project .env: {rollback}")
-            if changed_props:
-                try:
-                    write_atomic(props, original, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid)
-                    os.utime(props, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
-                except Exception as rollback:
-                    rollback_errors.append(f"properties: {rollback}")
-            for path in reversed(created):
-                try:
-                    path.unlink()
-                except OSError as rollback:
-                    rollback_errors.append(f"remove {path}: {rollback}")
-            for path in reversed(directories):
-                try:
-                    path.rmdir()
-                except OSError as rollback:
-                    rollback_errors.append(f"remove empty {path}: {rollback}")
-            if reloaded:
-                try:
-                    run(["/usr/bin/systemctl", "daemon-reload"])
-                except Exception as rollback:
-                    rollback_errors.append(f"reload after rollback: {rollback}")
-        else:
-            rollback_errors.append("activation began; validated files retained for safe operator inspection")
-        report.update(status="failed", phase=failure_phase, error=str(exc), rollback_errors=rollback_errors)
+        self.report["status"], self.report["phase"] = "installed", "complete"
+        self.save_report()
+
+    def restore_original(self, original, label, errors):
         try:
-            save_report()
+            original.restore()
+        except Exception as rollback:
+            errors.append(f"{label}: {rollback}")
+
+    def rollback(self):
+        errors = []
+        if self.linked_env:
+            self.restore_original(self.plan.source_env, "restore project .env", errors)
+        if self.changed_props:
+            self.restore_original(self.plan.properties, "properties", errors)
+        for path in reversed(self.created):
+            try:
+                path.unlink()
+            except OSError as rollback:
+                errors.append(f"remove {path}: {rollback}")
+        for path in reversed(self.directories):
+            try:
+                path.rmdir()
+            except OSError as rollback:
+                errors.append(f"remove empty {path}: {rollback}")
+        if self.reloaded:
+            try:
+                run(["/usr/bin/systemctl", "daemon-reload"])
+            except Exception as rollback:
+                errors.append(f"reload after rollback: {rollback}")
+        return errors
+
+    def fail(self, error):
+        phase = self.report["phase"]
+        if phase != "activate gateway" and self.report["status"] != "installed":
+            notes = self.rollback()
+        else:
+            notes = ["activation began; validated files retained for safe operator inspection"]
+        self.report.update(status="failed", phase=phase, error=str(error), rollback_errors=notes)
+        try:
+            self.save_report()
         except Exception as report_error:
-            rollback_errors.append(f"report: {report_error}")
-        raise RuntimeError(f"installation failed during {failure_phase}: {exc}; rollback notes: {rollback_errors}") from exc
+            notes.append(f"report: {report_error}")
+        raise RuntimeError(f"installation failed during {phase}: {error}; rollback notes: {notes}") from error
+
+    def run(self):
+        try:
+            self.install_files()
+            self.validate_installed_files()
+            self.update_properties()
+            self.link_configuration()
+            self.activate()
+            result = {"status": "installed", "gateway": "enabled", "backend": "not explicitly started or enabled",
+                      "report": str(self.plan.report_path), "configuration": str(self.plan.roots[1] / ".env")}
+            print(json.dumps(result))
+            return result
+        except Exception as error:
+            self.fail(error)
+
+
+def install(env_path, report_path, *, binary_path):
+    plan = prepare_installation(env_path, report_path, binary_path)
+    return InstallationTransaction(plan).run()

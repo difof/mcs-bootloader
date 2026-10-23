@@ -123,7 +123,7 @@ func Run(ctx context.Context, action string, args []string, opts Options) (json.
 		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
 	// Python translates SIGTERM into an exception so install transactions can
-	// roll back. Signal its subprocess group as well, including a running tar.
+	// roll back. Signal its helper subprocess group as well.
 	command.Cancel = func() error {
 		if command.Process == nil {
 			return os.ErrProcessDone

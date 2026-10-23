@@ -33,6 +33,7 @@ var helpCommands = []helpCommand{
 	{"metrics [--raw]", "Show cached Prometheus samples; --raw prints scrape text, --json returns structured samples."},
 	{"serve", "Run the gateway in the foreground (normally managed by systemd)."},
 	{"version", "Show the executable version."},
+	{"license", "Show the embedded AGPL-3.0-only license."},
 }
 
 func printHelp(o cliOptions, out *cliOutput) error {

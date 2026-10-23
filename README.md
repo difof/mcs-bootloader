@@ -1,43 +1,69 @@
 # mcs-bootloader
 
-Let a heavy Minecraft server sleep when nobody is playing. A small Go gateway stays online, wakes Minecraft on an allowed login, and saves/stops it after **15 minutes idle** by default.
+**Let your Minecraft server sleep. Wake it when someone joins.**
 
-**Linux/systemd · Minecraft Java 1.21.1 / protocol 767 · modded servers supported.** Once ready, the original handshake and game/mod traffic pass through unchanged. Server-list pings do not wake it. A join during startup gets a reconnect message with an approximate countdown learned from previous successful boots.
+[![Release](https://img.shields.io/github/v/release/difof/mcs-bootloader)](https://github.com/difof/mcs-bootloader/releases)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
 
-Shutdown uses loopback RCON `stop`. Unknown player counts and active joins prevent sleep; there is no backend restart loop or force-kill. Native Minecraft whitelist policy controls admission. Optional Prometheus metrics cover the gateway, Minecraft, RCON, players, JVM, uptime, boot timing and watched folders.
+This README follows `master`. For a released executable, use the documentation at its release tag; the expanded compatibility below is newer than v0.5.0.
 
-## Install
+A small Go gateway stays online while a heavy Java server rests. An allowed login starts Minecraft; the player gets a reconnect message with an approximate boot countdown. Once ready, the original handshake and game/mod traffic pass through unchanged.
 
-Download the executable for your architecture from [Releases](https://github.com/difof/mcs-bootloader/releases), verify it against `SHA256SUMS`, and rename it to `mcs-bootloader`.
+- **Sleep safely.** After 15 minutes empty by default, loopback RCON saves and stops Minecraft. Unknown player counts and pending joins prevent shutdown.
+- **Keep your modpack.** Five small login profiles cover stable Java releases from **1.7.10 through 26.1.2**. The relay does not translate gameplay packets; clients still need the matching game and modpack.
+- **Operate from one binary.** Initialize, install, send console commands, inspect logs and update configuration without a source checkout. Python helpers and service templates are embedded.
+- **See what is happening.** Quiet event logs and optional Prometheus metrics cover the gateway, Minecraft, players, RCON, JVM, boot timing, uptime and watched folders.
 
-Requirements: an existing working Minecraft server and Java, Linux with systemd/journald namespaces and `busctl`, Python **3.10+**, `sudo`, `runuser`, `visudo`, `getconf`, and a non-root account that owns the server. Release users need no Go, Task, Git or source checkout: operator scripts and service templates are embedded.
+Server-list pings never wake Minecraft. Native whitelist settings control the early admission check, and Minecraft remains responsible for final authentication. A booting connection receives a message and reconnects; it is not held in a fake lobby.
 
-Stop Minecraft and its old launcher/restart loop first, then:
+## Quick start
+
+You need an existing working Minecraft server, Linux/systemd, Python **3.10+**, and an operator with sudo access. The server runs under its own non-root account. See the [complete dependencies and installation guide](docs/install.md#requirements).
+
+1. Download the executable for your architecture from [Releases](https://github.com/difof/mcs-bootloader/releases), verify it against `SHA256SUMS`, and rename it to `mcs-bootloader`.
+2. Stop Minecraft and its old launcher/restart loop.
+3. Initialize, configure and install:
 
 ```sh
 chmod +x ./mcs-bootloader
 ./mcs-bootloader init
 ./mcs-bootloader config edit
-# Set MC_SERVICE_USER, MC_SERVER_DIRECTORY, MC_LAUNCH_EXECUTABLE and MC_LAUNCH_ARGS.
 ./mcs-bootloader install
 ```
 
-The installer configures the backend and RCON on loopback and starts the gateway. Minecraft stays asleep until a login or `start`. Forward only the public gateway port, default **25565**. The installed command is `/opt/mcs-bootloader/bin/mcs-bootloader`; put it on your PATH for the examples below. See [installation and updates](docs/install.md) for details.
+Set your paths and service account in `.env`. For example:
 
-## Everyday commands
-
-```sh
-mcs-bootloader status
-mcs-bootloader start
-mcs-bootloader command -- op PlayerName
-mcs-bootloader logs --server --follow
-mcs-bootloader stop
-mcs-bootloader stats
+```dotenv
+MC_SERVICE_USER=minecraft
+MC_SERVER_DIRECTORY=/srv/minecraft
+MC_LAUNCH_EXECUTABLE=/usr/bin/java
+MC_LAUNCH_ARGS='["-Xms2G","-Xmx6G","-jar","server.jar","nogui"]'
+MC_PROTOCOL=767
+MC_VERSION=1.21.1
+MC_IDLE_TIMEOUT=15m
 ```
 
-`stop` saves and shuts down only when the server is confirmed empty, with no active joins. Later logins can wake it again. `gateway stop` stops public access and wake monitoring while Java stays running. Human output supports terminal colors; append `--json` for machine output, including structured log records.
+Use your modpack's actual launch arguments and [matching protocol number](docs/compatibility.md). `init` generates the RCON password. Installation configures loopback backend/RCON ports and starts the gateway; Minecraft waits for a login or `start`. Forward only the public gateway port, **25565** by default.
 
-All operator settings, including the RCON password, live in the private `.env`. Edit and apply supported settings without a gateway restart:
+The installed executable is `/opt/mcs-bootloader/bin/mcs-bootloader`. Put it on your PATH to use the commands below. Release users need no Go, Task, Git or source files.
+
+## Everyday use
+
+| What you want | Command |
+| --- | --- |
+| See server state | `mcs-bootloader status` |
+| Start Minecraft | `mcs-bootloader start` |
+| Send an operator command | `mcs-bootloader command -- op PlayerName` |
+| Follow the Minecraft console | `mcs-bootloader logs --server --follow` |
+| Save and stop an empty server | `mcs-bootloader stop` |
+| Inspect uptime, JVM and folder metrics | `mcs-bootloader stats` |
+| Restart the gateway | `mcs-bootloader gateway restart` |
+
+`stop` refuses active or unknown players and pending joins; later logins can wake the server again. A gateway restart disconnects relayed clients with the configured restart reason where RCON is available, while Java keeps running. Human output supports terminal colors and `NO_COLOR`; add `--json` for machine output.
+
+### Edit configuration without restarting
+
+All operator settings, including the RCON password, live in one private `.env`:
 
 ```sh
 mcs-bootloader config edit
@@ -45,21 +71,22 @@ mcs-bootloader config check
 mcs-bootloader config reload /etc/mcs-bootloader/.env
 ```
 
-Reload validates the complete file and applies it atomically over the private socket. It never writes settings back to disk. The [complete example](.env.example) includes launch arguments, idle timers, reconnect/restart messages, MOTD overrides and metrics options.
+Reload validates the file and applies supported settings atomically through the private socket. It never writes settings back to disk. Timers, messages, MOTD overrides and metrics are live settings; network/process changes need the restart or migration described in [Configuration](docs/configuration.md). The [complete example](.env.example) lists every setting.
 
 ## Guides
 
-| Guide | Covers |
+| Guide | Find out about |
 | --- | --- |
-| [Install](docs/install.md) | Dependencies, first setup, custom launchers, updates and removal |
-| [CLI and Task](docs/cli.md) | Full command reference, console access, JSON/color and development wrappers |
-| [Configuration](docs/configuration.md) | `.env`, live reload, MOTD, whitelist and startup estimates |
-| [Lifecycle and access](docs/lifecycle.md) | Sleep/wake behavior, process ownership and troubleshooting |
-| [Metrics](docs/metrics.md) | Prometheus, server uptime, startup timing, JVM/player data and folder sizes |
+| [Installation](docs/install.md) | Dependencies, setup, custom launchers, updates and removal |
+| [CLI and Task](docs/cli.md) | Commands, console access, JSON/color and source wrappers |
+| [Configuration](docs/configuration.md) | `.env`, live reload, MOTD, whitelist and boot estimates |
+| [Compatibility](docs/compatibility.md) | Version profiles, protocol numbers, modded traffic and tested boundaries |
+| [Lifecycle](docs/lifecycle.md) | Sleep/wake behavior, service ownership and troubleshooting |
+| [Metrics](docs/metrics.md) | Prometheus, JVM/player data, uptime, boot timing and folder sizes |
 
-## From source
+## Development
 
-Use Go **1.24+**, Python 3.10+ and [Task 3](https://taskfile.dev/). Race tests also need a C compiler. Every operator task builds current source automatically using Go's compiler cache.
+Use Go **1.24+**, Python 3.10+, [Task 3](https://taskfile.dev/) and a C compiler for race tests. Operator tasks build current source automatically using Go's compiler cache.
 
 ```sh
 task check
@@ -67,7 +94,10 @@ task status -- --json
 task command -- op PlayerName
 task config:reload -- .env
 task logs:server:follow
-task cli -- help
 ```
 
-`task` lists tasks; [CLI and Task](docs/cli.md#source-development-with-task) maps every command. Local packaging and the Actions budget policy are documented in [AGENTS.md](AGENTS.md).
+`task` lists available tasks; `task cli -- <arguments>` runs any binary command. See the [Task reference](docs/cli.md#source-development-with-task) and [working agreements](AGENTS.md).
+
+## License
+
+Copyright © 2026 difof. Licensed under the **GNU Affero General Public License, version 3 only** (`AGPL-3.0-only`). See [LICENSE](LICENSE). Downloaded executables include the full text: `mcs-bootloader license` or `task license` from source.

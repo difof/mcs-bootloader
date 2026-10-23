@@ -13,7 +13,11 @@ import (
 )
 
 func handshakeFrame(host string, next int32) []byte {
-	p := AppendVarInt([]byte{0}, 767)
+	return handshakeForProtocol(host, next, 767)
+}
+
+func handshakeForProtocol(host string, next, protocol int32) []byte {
+	p := AppendVarInt([]byte{0}, protocol)
 	p = AppendVarInt(p, int32(len(host)))
 	p = append(p, host...)
 	p = binary.BigEndian.AppendUint16(p, 25565)
@@ -110,7 +114,7 @@ func TestLoginStartRequiresCompleteEnvelope(t *testing.T) {
 			t.Fatal("accepted incomplete UUID or trailing data")
 		}
 	}
-	if _, _, err := ReadLoginStart(bytes.NewReader(frame), 763); err == nil {
+	if _, _, err := ReadLoginStart(bytes.NewReader(frame), 776); err == nil {
 		t.Fatal("accepted an unsupported login layout")
 	}
 }

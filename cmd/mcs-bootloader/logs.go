@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -29,6 +30,14 @@ func runLogs(ctx context.Context, o cliOptions, out *cliOutput, original []strin
 	if err != nil {
 		return err
 	}
+	args, err := journalArguments(o, values)
+	if err != nil {
+		return err
+	}
+	return readJournal(ctx, args, values["MC_RCON_PASSWORD"], out)
+}
+
+func journalArguments(o cliOptions, values map[string]string) ([]string, error) {
 	unit := values["MC_GATEWAY_SERVICE"]
 	if unit == "" {
 		unit = "mcs-bootloader.service"
@@ -44,22 +53,34 @@ func runLogs(ctx context.Context, o cliOptions, out *cliOutput, original []strin
 		namespace = "mcs-bootloader"
 	}
 	if !logUnitPattern.MatchString(unit) || !logNamespacePattern.MatchString(namespace) {
-		return errors.New("invalid journal unit or namespace in .env")
+		return nil, errors.New("invalid journal unit or namespace in .env")
 	}
-	lines := o.Lines
-	if lines == 0 {
-		lines = 100
-		if text := values["MC_LOG_LINES"]; text != "" {
-			lines, err = strconv.Atoi(text)
-			if err != nil || lines < 1 || lines > 100000 {
-				return errors.New("MC_LOG_LINES must be between 1 and 100000")
-			}
-		}
+	lines, err := journalLines(o.Lines, values["MC_LOG_LINES"])
+	if err != nil {
+		return nil, err
 	}
 	args := []string{"--namespace=" + namespace, "--unit=" + unit, "--lines=" + strconv.Itoa(lines), "--output=json", "--no-pager", "--output-fields=__REALTIME_TIMESTAMP,MESSAGE,PRIORITY,_SYSTEMD_UNIT"}
 	if o.Follow {
 		args = append(args, "--follow")
 	}
+	return args, nil
+}
+
+func journalLines(explicit int, configured string) (int, error) {
+	if explicit != 0 {
+		return explicit, nil
+	}
+	if configured == "" {
+		return 100, nil
+	}
+	lines, err := strconv.Atoi(configured)
+	if err != nil || lines < 1 || lines > 100000 {
+		return 0, errors.New("MC_LOG_LINES must be between 1 and 100000")
+	}
+	return lines, nil
+}
+
+func readJournal(ctx context.Context, args []string, password string, out *cliOutput) error {
 	command := exec.CommandContext(ctx, "journalctl", args...)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
@@ -70,26 +91,7 @@ func runLogs(ctx context.Context, o cliOptions, out *cliOutput, original []strin
 	if err = command.Start(); err != nil {
 		return fmt.Errorf("start journal reader: %w", err)
 	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 4096), 4<<20)
-	var renderErr error
-	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) == "" {
-			continue
-		}
-		record, err := journalRecord(scanner.Bytes(), values["MC_RCON_PASSWORD"])
-		if err != nil {
-			renderErr = err
-			break
-		}
-		if err = out.Log(record); err != nil {
-			renderErr = err
-			break
-		}
-	}
-	if renderErr == nil {
-		renderErr = scanner.Err()
-	}
+	renderErr := renderJournal(stdout, password, out)
 	if renderErr != nil && command.Process != nil {
 		_ = command.Process.Kill()
 	}
@@ -104,6 +106,24 @@ func runLogs(ctx context.Context, o cliOptions, out *cliOutput, original []strin
 		return fmt.Errorf("journal reader failed: %s", cleanText(diagnostic.String()))
 	}
 	return nil
+}
+
+func renderJournal(reader io.Reader, password string, out *cliOutput) error {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4096), 4<<20)
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		record, err := journalRecord(scanner.Bytes(), password)
+		if err != nil {
+			return err
+		}
+		if err = out.Log(record); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
 }
 
 type boundedText struct{ strings.Builder }

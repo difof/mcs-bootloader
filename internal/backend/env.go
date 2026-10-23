@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -17,88 +16,26 @@ const maxEnvBytes = 64 * 1024
 var envAssignment = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$`)
 var envInlineComment = regexp.MustCompile(`[ \t]+#`)
 
-// LoadEnv parses the shared .env as data. It does not execute a shell, expand
-// variables, or inherit process environment values. LoadConfig additionally
-// checks the file's permissions; this entry point is for private snapshots.
+// LoadEnv parses one private snapshot as data, without shell expansion or
+// process environment inheritance. LoadConfig also checks file permissions.
 func LoadEnv(data []byte) (Config, error) {
 	c := DefaultConfig()
 	c.RCONPasswordFile = ""
-	if len(data) > maxEnvBytes {
-		return c, fmt.Errorf("environment file exceeds 64 KiB")
+	if err := validateEnvBytes(data); err != nil {
+		return c, err
 	}
-	if i := bytes.IndexAny(data, "\x00\r"); i >= 0 {
-		return c, envError(bytes.Count(data[:i], []byte("\n"))+1, "", "NUL and carriage return are not allowed; use LF line endings")
-	}
-	if !utf8.Valid(data) {
-		return c, fmt.Errorf("environment file must contain valid UTF-8")
-	}
-	stringFields := map[string]*string{
-		"MC_LISTEN":            &c.Listen,
-		"MC_BACKEND_ADDRESS":   &c.BackendAddress,
-		"MC_RCON_ADDRESS":      &c.RCONAddress,
-		"MC_RCON_PASSWORD":     &c.RCONPassword,
-		"MC_BACKEND_SERVICE":   &c.Service,
-		"MC_STATE_DIRECTORY":   &c.StateDirectory,
-		"MC_ADMIN_SOCKET":      &c.AdminSocket,
-		"MC_SERVER_DIRECTORY":  &c.ServerDirectory,
-		"MC_LAUNCH_EXECUTABLE": &c.LaunchExecutable,
-		"MC_VERSION":           &c.Version,
-		"MC_BOOT_MESSAGE":      &c.BootMessage,
-		"MC_SLEEPING_MOTD":     &c.SleepingMOTD,
-		"MC_STARTING_MOTD":     &c.StartingMOTD,
-		"MC_STOPPING_MOTD":     &c.StoppingMOTD,
-		"MC_UNKNOWN_MOTD":      &c.UnknownMOTD,
-		"MC_FAILED_MOTD":       &c.FailedMOTD,
-		"MC_MOTD":              &c.MOTD,
-		"MC_RESTART_MESSAGE":   &c.RestartMessage,
-		"MC_WHITELIST_MESSAGE": &c.WhitelistMessage,
-		"MC_METRICS_LISTEN":    &c.MetricsListen,
-		"MC_LOG_LEVEL":         &c.LogLevel,
-	}
-	durationFields := map[string]*Duration{
-		"MC_IDLE_TIMEOUT":               &c.IdleTimeout,
-		"MC_POLL_INTERVAL":              &c.PollInterval,
-		"MC_OPERATION_TIMEOUT":          &c.OperationTimeout,
-		"MC_STARTUP_TIMEOUT":            &c.StartupTimeout,
-		"MC_SHUTDOWN_WARN_AFTER":        &c.ShutdownWarnAfter,
-		"MC_WAKE_COOLDOWN":              &c.WakeCooldown,
-		"MC_HANDSHAKE_TIMEOUT":          &c.HandshakeTimeout,
-		"MC_DIAL_TIMEOUT":               &c.DialTimeout,
-		"MC_RESTART_GRACE":              &c.RestartGrace,
-		"MC_METRICS_POLL_INTERVAL":      &c.MetricsPollInterval,
-		"MC_METRICS_PLAYER_INTERVAL":    &c.MetricsPlayerInterval,
-		"MC_METRICS_DIRECTORY_INTERVAL": &c.MetricsDirectoryInterval,
-		"MC_METRICS_DIRECTORY_TIMEOUT":  &c.MetricsDirectoryTimeout,
-	}
-	booleanFields := map[string]*bool{"MC_OVERRIDE_MOTD": &c.OverrideMOTD, "MC_METRICS_ENABLED": &c.MetricsEnabled, "MC_METRICS_PLAYER_DETAILS": &c.MetricsPlayerDetails}
-	var logLines int
-	integerFields := map[string]*int{
-		"MC_PROTOCOL":        &c.Protocol,
-		"MC_MAX_PLAYERS":     &c.MaxPlayers,
-		"MC_MAX_CONNECTIONS": &c.MaxConnections,
-		"MC_LOG_LINES":       &logLines,
-	}
-	taskFields := map[string]bool{
-		"MC_BINARY": true, "MC_CONFIG": true, "MC_SERVICE_USER": true,
-		"MC_GATEWAY_SERVICE": true, "MC_LOG_NAMESPACE": true,
-		"MC_COMMAND_TIMEOUT": true,
-	}
+	fields := newEnvFields(&c)
 	seen := make(map[string]bool)
-	for lineIndex, line := range strings.Split(string(data), "\n") {
-		number := lineIndex + 1
-		line = strings.Trim(line, " \t")
-		if line == "" || strings.HasPrefix(line, "#") {
+	for index, line := range strings.Split(string(data), "\n") {
+		number := index + 1
+		key, literal, err := envAssignmentParts(line)
+		if err != nil {
+			return c, envError(number, "", err.Error())
+		}
+		if key == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "export ") || strings.HasPrefix(line, "export\t") {
-			line = strings.TrimLeft(line[6:], " \t")
-		}
-		parts := envAssignment.FindStringSubmatch(line)
-		if parts == nil {
-			return c, envError(number, "", "expected KEY=value")
-		}
-		key, literal := parts[1], parts[2]
-		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && booleanFields[key] == nil && !taskFields[key] && key != "MC_LAUNCH_ARGS" && key != "MC_METRICS_DIRECTORIES" {
+		if !fields.known(key) {
 			return c, envError(number, key, "unknown setting")
 		}
 		if seen[key] {
@@ -106,72 +43,11 @@ func LoadEnv(data []byte) (Config, error) {
 		}
 		seen[key] = true
 		value, err := parseEnvValue(literal)
+		if err == nil {
+			err = fields.assign(&c, key, value)
+		}
 		if err != nil {
 			return c, envError(number, key, err.Error())
-		}
-		if target := booleanFields[key]; target != nil {
-			switch strings.ToLower(value) {
-			case "true":
-				*target = true
-			case "false":
-				*target = false
-			default:
-				return c, envError(number, key, "must be true or false")
-			}
-			continue
-		}
-		if target := integerFields[key]; target != nil {
-			if !decimalDigits(value) {
-				return c, envError(number, key, "must be a positive decimal integer")
-			}
-			// Normalize before parsing so an arbitrary number of leading zeroes
-			// behaves identically to the management parser.
-			digits := strings.TrimLeft(value, "0")
-			if digits == "" {
-				digits = "0"
-			}
-			n, err := strconv.ParseInt(digits, 10, strconv.IntSize)
-			if err != nil || n < 1 {
-				return c, envError(number, key, "integer must be positive and within range")
-			}
-			*target = int(n)
-			continue
-		}
-		if err := validateEnvString(key, value); err != nil {
-			return c, envError(number, key, err.Error())
-		}
-		if key == "MC_METRICS_DIRECTORIES" {
-			directories, err := parseMetricsDirectories(value)
-			if err != nil {
-				return c, envError(number, key, err.Error())
-			}
-			c.MetricsDirectories = directories
-			continue
-		}
-		if key == "MC_LAUNCH_ARGS" {
-			var encoded []json.RawMessage
-			if err := json.Unmarshal([]byte(value), &encoded); err != nil || encoded == nil || len(encoded) > maxLaunchArgs || !validJSONSurrogates(value) {
-				return c, envError(number, key, "must be a JSON array containing at most 256 valid Unicode strings")
-			}
-			args := make([]string, len(encoded))
-			for i, raw := range encoded {
-				if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &args[i]) != nil {
-					return c, envError(number, key, "every array item must be a string")
-				}
-			}
-			c.LaunchArgs = args
-			continue
-		}
-		if target := stringFields[key]; target != nil {
-			*target = value
-			continue
-		}
-		if target := durationFields[key]; target != nil {
-			d, err := time.ParseDuration(value)
-			if err != nil {
-				return c, envError(number, key, "must use valid Go duration syntax")
-			}
-			*target = Duration(d)
 		}
 	}
 	if !seen["MC_RCON_PASSWORD"] {
@@ -181,6 +57,34 @@ func LoadEnv(data []byte) (Config, error) {
 		return c, fmt.Errorf("environment configuration: %w", err)
 	}
 	return c, nil
+}
+
+func validateEnvBytes(data []byte) error {
+	if len(data) > maxEnvBytes {
+		return fmt.Errorf("environment file exceeds 64 KiB")
+	}
+	if i := bytes.IndexAny(data, "\x00\r"); i >= 0 {
+		return envError(bytes.Count(data[:i], []byte("\n"))+1, "", "NUL and carriage return are not allowed; use LF line endings")
+	}
+	if !utf8.Valid(data) {
+		return fmt.Errorf("environment file must contain valid UTF-8")
+	}
+	return nil
+}
+
+func envAssignmentParts(line string) (string, string, error) {
+	line = strings.Trim(line, " \t")
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", nil
+	}
+	if strings.HasPrefix(line, "export ") || strings.HasPrefix(line, "export\t") {
+		line = strings.TrimLeft(line[6:], " \t")
+	}
+	parts := envAssignment.FindStringSubmatch(line)
+	if parts == nil {
+		return "", "", fmt.Errorf("expected KEY=value")
+	}
+	return parts[1], parts[2], nil
 }
 
 func envError(line int, key, message string) error {

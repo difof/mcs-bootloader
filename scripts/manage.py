@@ -154,142 +154,165 @@ def embedded_system(argv, *, user=None):
     return run(argv, capture=True)
 
 
-def embedded_operate(action, arguments, env_path, executable):
-    """Source-independent dispatcher called by the binary's isolated helper."""
-    env_path, executable = Path(env_path).absolute(), Path(executable).absolute()
-    result = {"ok": True, "action": action}
-    if action in ("init", "config-new"):
-        require(not arguments, "init accepts one output path through --env")
-        require(not os.path.lexists(env_path), ".env already exists; use config edit")
-        require(env_path.parent.is_dir(), "configuration parent directory does not exist")
-        example = (ROOT / ".env.example").read_text()
-        placeholder = "replace-with-a-random-private-password"
-        require(example.count(placeholder) == 1, "embedded credential marker is invalid")
-        data = example.replace(placeholder, secrets.token_urlsafe(32))
-        descriptor = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        result.update(path=str(env_path), message="Created private .env with a random RCON password. Configure your Minecraft paths and service account before installation.")
-        return result
+def create_config(arguments, env_path):
+    require(not arguments, "init accepts one output path through --env")
+    require(not os.path.lexists(env_path), ".env already exists; use config edit")
+    require(env_path.parent.is_dir(), "configuration parent directory does not exist")
+    example = (ROOT / ".env.example").read_text()
+    placeholder = "replace-with-a-random-private-password"
+    require(example.count(placeholder) == 1, "embedded credential marker is invalid")
+    data = example.replace(placeholder, secrets.token_urlsafe(32))
+    descriptor = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {"path": str(env_path), "message": "Created private .env with a random RCON password. Configure your Minecraft paths and service account before installation."}
 
-    if action == "config-link":
-        require(not arguments, "config link takes no extra arguments")
-        canonical = Path(MANAGE_DEFAULTS["MC_CONFIG"])
-        require(canonical.is_file(), "installed canonical .env is missing")
-        if env_path.is_symlink() and env_path.resolve() == canonical.resolve():
-            result.update(path=str(env_path), changed=False, message="Configuration link is already correct.")
-            return result
-        require(not os.path.lexists(env_path), "refusing to overwrite an existing configuration file or link")
-        env_path.symlink_to(canonical)
-        result.update(path=str(env_path), changed=True, message="Linked the installed canonical .env; no configuration was copied.")
-        return result
 
-    if action == "config-edit":
-        require(not arguments, "config edit takes no extra arguments")
-        source = env_path.resolve(strict=True)
-        require(source.is_file(), "configuration must be a regular file")
-        editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano")
-        require(editor, "EDITOR is empty")
-        # Terminal output stays on the terminal, preserving the CLI's JSON
-        # stdout contract. Resolve links before editors perform atomic saves.
-        os.umask(0o027)
+def link_config(arguments, env_path):
+    require(not arguments, "config link takes no extra arguments")
+    canonical = Path(MANAGE_DEFAULTS["MC_CONFIG"])
+    require(canonical.is_file(), "installed canonical .env is missing")
+    if env_path.is_symlink() and env_path.resolve() == canonical.resolve():
+        return {"path": str(env_path), "changed": False, "message": "Configuration link is already correct."}
+    require(not os.path.lexists(env_path), "refusing to overwrite an existing configuration file or link")
+    env_path.symlink_to(canonical)
+    return {"path": str(env_path), "changed": True, "message": "Linked the installed canonical .env; no configuration was copied."}
+
+
+def edit_config(arguments, env_path):
+    require(not arguments, "config edit takes no extra arguments")
+    source = env_path.resolve(strict=True)
+    require(source.is_file(), "configuration must be a regular file")
+    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano")
+    require(editor, "EDITOR is empty")
+    # Resolve links before editors perform atomic saves. Their terminal output
+    # must not enter the CLI's JSON stdout stream.
+    os.umask(0o027)
+    try:
+        with open("/dev/tty", "r+b", buffering=0) as terminal:
+            returncode = edit_on_terminal(editor + [str(source)], terminal)
+    except OSError as error:
+        raise RuntimeError("config edit needs an interactive terminal and an installed EDITOR") from error
+    require(returncode == 0, "editor exited unsuccessfully")
+    return {"path": str(source), "message": "Configuration edited. Use config check, then config reload to apply supported settings."}
+
+
+def edit_on_terminal(argv, terminal):
+    edited = subprocess.Popen(argv, stdin=terminal, stdout=terminal, stderr=terminal)
+    try:
+        return edited.wait()
+    except BaseException:
+        # Only Python receives the CLI's explicit foreground cancellation.
+        # Close its editor too, without interrupting unrelated processes.
+        edited.terminate()
         try:
-            with open("/dev/tty", "r+b", buffering=0) as terminal:
-                edited = subprocess.Popen(editor + [str(source)], stdin=terminal,
-                                          stdout=terminal, stderr=terminal)
-                try:
-                    returncode = edited.wait()
-                except BaseException:
-                    # In an interactive foreground group only Python receives
-                    # the CLI's explicit cancel signal. Close its editor too.
-                    edited.terminate()
-                    try:
-                        edited.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        edited.kill()
-                        edited.wait()
-                    raise
-        except OSError as error:
-            raise RuntimeError("config edit needs an interactive terminal and an installed EDITOR") from error
-        require(returncode == 0, "editor exited unsuccessfully")
-        result.update(path=str(source), message="Configuration edited. Use config check, then config reload to apply supported settings.")
-        return result
+            edited.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            edited.kill()
+            edited.wait()
+        raise
 
-    if action == "config-show":
-        require(not arguments, "config show takes no extra arguments")
-        source, values = private_env(env_path)
-        result.update(path=str(source), settings=redacted_values(values))
-        return result
 
-    if action == "install":
-        import install
-        require(os.geteuid() == 0, "installation requires root")
-        parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
-        parser.add_argument("--report", type=Path, default=env_path.parent / ".mcs-bootloader-installation.json")
-        parsed, unknown = parser.parse_known_args(arguments)
-        require(not unknown, "install supports only --report PATH")
-        with contextlib.redirect_stdout(io.StringIO()):
-            data = install.install(env_path, parsed.report.absolute(), binary_path=executable)
-        result.update(data)
-        result["message"] = "Gateway installed and enabled; Minecraft starts when a player connects or you run start."
-        return result
+def show_config(arguments, env_path):
+    require(not arguments, "config show takes no extra arguments")
+    source, values = private_env(env_path)
+    return {"path": str(source), "settings": redacted_values(values)}
 
-    if action == "remove":
-        import remove
-        require(arguments in ([], ["--dry-run"], ["--yes"]), "remove accepts --dry-run or --yes")
-        return remove.remove(env_path, yes=arguments == ["--yes"])
 
+def install_gateway(arguments, env_path, executable):
+    import install
+    require(os.geteuid() == 0, "installation requires root")
+    parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    parser.add_argument("--report", type=Path, default=env_path.parent / ".mcs-bootloader-installation.json")
+    parsed, unknown = parser.parse_known_args(arguments)
+    require(not unknown, "install supports only --report PATH")
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = install.install(env_path, parsed.report.absolute(), binary_path=executable)
+    result["message"] = "Gateway installed and enabled; Minecraft starts when a player connects or you run start."
+    return result
+
+
+def deploy_gateway(canonical, cfg, executable):
+    import service_config
+    require(executable.is_file(), "the running executable is unavailable")
+    destination = Path(cfg["MC_BINARY"])
+    # Validate the destination and reject foreign unit edits before replacement.
+    service_config.secure_directory(destination.parent)
+    installed, _ = service_config.read_regular(destination, owned=True, limit=128 * 1024 * 1024)
+    service_config.preflight(canonical)
+    if executable.read_bytes() == installed:
+        configured = service_config.configure(canonical)
+        return {"changed": False, "service_changed": configured, "binary": str(destination),
+                "message": "This executable is already installed; service settings were checked and the previous rollback binary was preserved."}
+    replace_installed(executable, destination, hashlib.sha256(installed).hexdigest(), config=str(canonical))
+    try:
+        configured = service_config.configure(canonical)
+    except Exception as error:
+        raise RuntimeError("Executable installed, but service settings could not be refreshed; "
+                           "the running gateway and Minecraft were not restarted. "
+                           f"Previous executable: {destination}.previous. Review gateway configure before restarting: {error}") from error
+    return {"changed": True, "service_changed": configured, "binary": str(destination), "previous": str(destination) + ".previous",
+            "message": "Executable installed atomically and service settings refreshed. Run gateway restart to use it; Minecraft stays running."}
+
+
+def preflight_gateway_start(canonical, cfg):
+    state = embedded_system(["/usr/bin/systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
+                             "--property=ActiveState", "--value"]).strip()
+    if state in ("active", "activating", "reloading"):
+        check = [cfg["MC_BINARY"], "restart-check", "--socket", cfg["MC_ADMIN_SOCKET"],
+                 "--config", str(canonical)]
+    else:
+        require(state in ("inactive", "failed"), "gateway is stopping or its state is unknown; wait before starting it")
+        check = [cfg["MC_BINARY"], "check", "--config", str(canonical)]
+    embedded_system(check, user=cfg["MC_SERVICE_USER"])
+
+
+def control_gateway(action, canonical, cfg):
+    verb = action.removeprefix("gateway-")
+    if verb in ("start", "restart"):
+        preflight_gateway_start(canonical, cfg)
+    embedded_system(["/usr/bin/systemctl", verb, cfg["MC_GATEWAY_SERVICE"]])
+    return {"service": cfg["MC_GATEWAY_SERVICE"],
+            "message": f"Gateway {verb} completed. Minecraft was left running if it was already up."}
+
+
+def operate_installed(action, arguments, env_path, executable):
     require(not arguments, "this operator command takes no extra arguments")
-    canonical, values, cfg = embedded_canonical(env_path)
+    canonical, _, cfg = embedded_canonical(env_path)
     require(os.geteuid() == 0, "this operator command requires root")
     if action == "deploy":
-        require(executable.is_file(), "the running executable is unavailable")
-        destination = Path(cfg["MC_BINARY"])
-        # Destination and parents are validated before the privileged replace.
-        import service_config
-        service_config.secure_directory(destination.parent)
-        installed, _ = service_config.read_regular(destination, owned=True, limit=128 * 1024 * 1024)
-        # Reject pending/foreign unit edits before copying a candidate binary.
-        service_config.preflight(canonical)
-        if executable.read_bytes() == installed:
-            configured = service_config.configure(canonical)
-            result.update(changed=False, service_changed=configured, binary=str(destination),
-                          message="This executable is already installed; service settings were checked and the previous rollback binary was preserved.")
-            return result
-        replace_installed(executable, destination, hashlib.sha256(installed).hexdigest(), config=str(canonical))
-        try:
-            configured = service_config.configure(canonical)
-        except Exception as error:
-            raise RuntimeError("Executable installed, but service settings could not be refreshed; "
-                               "the running gateway and Minecraft were not restarted. "
-                               f"Previous executable: {destination}.previous. Review gateway configure before restarting: {error}") from error
-        result.update(changed=True, service_changed=configured, binary=str(destination), previous=str(destination) + ".previous",
-                      message="Executable installed atomically and service settings refreshed. Run gateway restart to use it; Minecraft stays running.")
-        return result
+        return deploy_gateway(canonical, cfg, executable)
     if action == "gateway-configure":
         import service_config
         changed = service_config.configure(canonical)
-        result.update(changed=changed, message="Gateway service settings configured; no service was restarted." if changed else "Gateway service settings are already configured.")
-        return result
+        return {"changed": changed, "message": "Gateway service settings configured; no service was restarted." if changed else "Gateway service settings are already configured."}
     if action in ("gateway-start", "gateway-stop", "gateway-restart"):
-        verb = action.removeprefix("gateway-")
-        if verb in ("start", "restart"):
-            state = embedded_system(["/usr/bin/systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
-                                     "--property=ActiveState", "--value"]).strip()
-            if state in ("active", "activating", "reloading"):
-                check = [cfg["MC_BINARY"], "restart-check", "--socket", cfg["MC_ADMIN_SOCKET"],
-                         "--config", str(canonical)]
-            else:
-                require(state in ("inactive", "failed"), "gateway is stopping or its state is unknown; wait before starting it")
-                check = [cfg["MC_BINARY"], "check", "--config", str(canonical)]
-            embedded_system(check, user=cfg["MC_SERVICE_USER"])
-        embedded_system(["/usr/bin/systemctl", verb, cfg["MC_GATEWAY_SERVICE"]])
-        result.update(service=cfg["MC_GATEWAY_SERVICE"],
-                      message=f"Gateway {verb} completed. Minecraft was left running if it was already up.")
-        return result
+        return control_gateway(action, canonical, cfg)
     raise RuntimeError("unknown embedded operator action")
+
+
+def embedded_operate(action, arguments, env_path, executable):
+    """Dispatch one source-independent operation with structured output."""
+    env_path, executable = Path(env_path).absolute(), Path(executable).absolute()
+    if action in ("init", "config-new"):
+        data = create_config(arguments, env_path)
+    elif action == "config-link":
+        data = link_config(arguments, env_path)
+    elif action == "config-edit":
+        data = edit_config(arguments, env_path)
+    elif action == "config-show":
+        data = show_config(arguments, env_path)
+    elif action == "install":
+        data = install_gateway(arguments, env_path, executable)
+    elif action == "remove":
+        import remove
+        require(arguments in ([], ["--dry-run"], ["--yes"]), "remove accepts --dry-run or --yes")
+        return remove.remove(env_path, yes=arguments == ["--yes"])
+    else:
+        data = operate_installed(action, arguments, env_path, executable)
+    return {"ok": True, "action": action, **data}
 
 
 def embedded_main():

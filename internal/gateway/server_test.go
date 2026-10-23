@@ -111,8 +111,12 @@ func startGateway(t *testing.T, cfg Config, controller *fakeController) (*Server
 }
 
 func handshakePacket(host string, state int) []byte {
+	return handshakePacketForProtocol(host, state, 767)
+}
+
+func handshakePacketForProtocol(host string, state, protocol int) []byte {
 	payload := mcproto.AppendVarInt(nil, 0)
-	payload = mcproto.AppendVarInt(payload, 767)
+	payload = mcproto.AppendVarInt(payload, int32(protocol))
 	payload = mcproto.AppendVarInt(payload, int32(len(host)))
 	payload = append(payload, host...)
 	payload = binary.BigEndian.AppendUint16(payload, 25565)
@@ -121,11 +125,14 @@ func handshakePacket(host string, state int) []byte {
 }
 
 func loginPacket(name string) []byte {
+	return loginPacketWithTail(name, bytes.Repeat([]byte{0xa5}, 16))
+}
+
+func loginPacketWithTail(name string, tail []byte) []byte {
 	payload := mcproto.AppendVarInt(nil, 0)
 	payload = mcproto.AppendVarInt(payload, int32(len(name)))
 	payload = append(payload, name...)
-	// Modern login-start has an opaque fixed-width UUID.
-	payload = append(payload, bytes.Repeat([]byte{0xA5}, 16)...)
+	payload = append(payload, tail...)
 	return mcproto.EncodePacket(payload)
 }
 
@@ -153,19 +160,37 @@ func eventually(t *testing.T, predicate func() bool) {
 }
 
 func TestOpaqueRelayPreservesOriginalFramesAndHalfClose(t *testing.T) {
+	for _, tc := range compatibilityCases {
+		t.Run(tc.version, func(t *testing.T) { testOpaqueRelay(t, tc.protocol, tc.tail) })
+	}
+}
+
+var compatibilityCases = []struct {
+	version  string
+	protocol int
+	tail     []byte
+}{
+	{"1.12.2", 340, nil},
+	{"1.19.2", 760, []byte{0, 0}},
+	{"1.21.1", 767, bytes.Repeat([]byte{0xa5}, 16)},
+	{"26.1.2", 775, bytes.Repeat([]byte{0xa5}, 16)},
+}
+
+func testOpaqueRelay(t *testing.T, protocol int, loginTail []byte) {
+	t.Helper()
 	backend, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.Close()
 	controller := &fakeController{state: control.Ready, healthy: true}
-	server, address, _ := startGateway(t, Config{BackendAddress: backend.Addr().String()}, controller)
-	handshake := handshakePacket("friends.example\x00FML3\x00", 2)
+	server, address, _ := startGateway(t, Config{BackendAddress: backend.Addr().String(), Protocol: protocol}, controller)
+	handshake := handshakePacketForProtocol("friends.example\x00FML3\x00", 2, protocol)
 	// Noncanonical but valid VarInt length: parsing must never normalize bytes
 	// on the backend connection. The original FML suffix must also survive.
 	handshake = append([]byte{handshake[0] | 0x80, 0}, handshake[1:]...)
 	opaque := bytes.Repeat([]byte{0xFE, 0, 0x80, 0xFF, 7, 9, 0xAA}, 4096)
-	expected := append(append(append([]byte(nil), handshake...), loginPacket("Mesut")...), opaque...)
+	expected := append(append(append([]byte(nil), handshake...), loginPacketWithTail("Mesut", loginTail)...), opaque...)
 	reply := bytes.Repeat([]byte{0x80, 0xFF, 0, 0xFE, 42, 13}, 2048)
 	backendDone := make(chan error, 1)
 	go func() {
@@ -252,10 +277,17 @@ func TestStatusNeverWakesAndPreservesModMetadata(t *testing.T) {
 }
 
 func TestSleepingLoginWakesAndGetsFriendlyDisconnect(t *testing.T) {
+	for _, tc := range compatibilityCases {
+		t.Run(tc.version, func(t *testing.T) { testSleepingLogin(t, tc.protocol, tc.tail) })
+	}
+}
+
+func testSleepingLogin(t *testing.T, protocol int, loginTail []byte) {
+	t.Helper()
 	controller := &fakeController{state: control.Asleep}
-	server, address, _ := startGateway(t, Config{BootMessage: "Server is booting. Please reconnect shortly."}, controller)
+	server, address, _ := startGateway(t, Config{Protocol: protocol, BootMessage: "Server is booting. Please reconnect shortly."}, controller)
 	client := dialClient(t, address)
-	packet := append(handshakePacket("friends.example", 2), loginPacket("Mzar")...)
+	packet := append(handshakePacketForProtocol("friends.example", 2, protocol), loginPacketWithTail("Mzar", loginTail)...)
 	if err := writeAll(client, packet); err != nil {
 		t.Fatal(err)
 	}

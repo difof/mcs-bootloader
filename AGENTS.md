@@ -3,6 +3,9 @@
 - Use Go's standard library unless a dependency clearly reduces risk.
 - The standalone binary is the operator interface. Source Taskfile tasks are thin wrappers around the built binary or development tools. Keep changes focused and reviewable.
 - Preserve original Minecraft handshake/login bytes and opaque mod traffic.
+- Keep protocol compatibility in small, explicit envelope profiles for verified stable versions. Preserve opaque mod/gameplay traffic; do not translate it or silently accept future/snapshot wire formats. Cover meaningful format boundaries with representative fixtures, not a test matrix for every patch release.
+- Separate parsing, policy, state transitions, I/O and presentation into focused functions/modules. Split a function when it has independent responsibilities; do not add speculative interfaces or fragment clear declarative tables just to hit a line count. Reuse existing tests for behavior-preserving cleanup.
+- License project code under AGPL-3.0-only. Keep the complete LICENSE text, README declaration, and embedded CLI license consistent; never change this to an "or later" license implicitly.
 - Treat unknown player counts as occupied. Never force-kill the game server.
 - Serialize wake and sleep; protect pending joins against idle shutdown.
 - Keep configuration, credentials, caches, logs, binaries, and host details out of Git.

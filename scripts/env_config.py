@@ -20,6 +20,15 @@ import re
 MAX_ENV_BYTES = 64 * 1024
 MAX_INTEGER = (1 << 63) - 1
 
+# Stable Java envelopes, kept in parity with internal/mcproto/version.go.
+SUPPORTED_PROTOCOLS = frozenset({
+    5, 47, 107, 108, 109, 110, 210, 315, 316, 335, 338, 340,
+    393, 401, 404, 477, 480, 485, 490, 498, 573, 575, 578,
+    735, 736, 751, 753, 754, 755, 756, 757, 758,
+    759, 760, 761, 762, 763, 764, 765, 766, 767, 768, 769,
+    770, 771, 772, 773, 774, 775,
+})
+
 CONFIG_KEYS = {
     "MC_LISTEN": "listen",
     "MC_BACKEND_ADDRESS": "backend_address",
@@ -177,6 +186,8 @@ def _validate_value(key, value, line=None):
             value = int(digits)
         if type(value) is not int or not 1 <= value <= MAX_INTEGER:
             _error("must be a positive integer within the signed 64-bit range", key, line)
+        if key == "MC_PROTOCOL" and value not in SUPPORTED_PROTOCOLS:
+            _error("unsupported protocol; use a stable Java release from 1.7.10 through 26.1.2", key, line)
         return value
 
     if not isinstance(value, str):
@@ -261,7 +272,8 @@ def validate_values(values):
 
     This checks the data format, not the complete runtime configuration. The Go
     configuration check remains authoritative for addresses, durations, paths,
-    service names, protocol support, and relationships between settings.
+    service names, and relationships between settings. Both readers reject
+    protocol numbers outside the verified stable-version allowlist.
     """
     if not isinstance(values, Mapping):
         _error("settings must be a mapping")

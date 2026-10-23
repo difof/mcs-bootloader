@@ -1,13 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -20,7 +15,6 @@ import (
 	"github.com/difof/mcs-bootloader/internal/control"
 	"github.com/difof/mcs-bootloader/internal/gateway"
 	"github.com/difof/mcs-bootloader/internal/rcon"
-	"github.com/difof/mcs-bootloader/internal/telemetry"
 )
 
 func serve(configPath string) error {
@@ -28,12 +22,7 @@ func serve(configPath string) error {
 }
 
 func serveWithOutput(configPath string, output *cliOutput) error {
-	configPath, err := filepath.Abs(configPath)
-	if err != nil {
-		return err
-	}
-	// Keep the actual startup source stable across aliases and atomic edits.
-	configPath, err = filepath.EvalSymlinks(configPath)
+	configPath, err := canonicalStartupConfig(configPath)
 	if err != nil {
 		return err
 	}
@@ -41,27 +30,12 @@ func serveWithOutput(configPath string, output *cliOutput) error {
 	if err != nil {
 		return err
 	}
-	level := new(slog.LevelVar)
-	level.Set(parseLogLevel(cfg.LogLevel))
-	var logOutput io.Writer = output.Out
-	// Keep journal records structured even for existing installations whose unit
-	// predates the explicit --json flag; foreground runs use human formatting.
-	if !output.JSON && os.Getenv("INVOCATION_ID") == "" {
-		logOutput = logWriter{output: output}
-	}
-	log := slog.New(slog.NewJSONHandler(logOutput, &slog.HandlerOptions{Level: level}))
-	password := cfg.RCONPassword
-	if err := os.MkdirAll(cfg.StateDirectory, 0700); err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(cfg.StateDirectory, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	log, level := daemonLogger(cfg.LogLevel, output)
+	lock, err := lockStateDirectory(cfg.StateDirectory)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return fmt.Errorf("another gateway owns this state directory: %w", err)
-	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
@@ -69,265 +43,73 @@ func serveWithOutput(configPath string, output *cliOutput) error {
 	// its native disconnect. The controller has a separate cancellation path.
 	ctx, cancelTraffic := context.WithCancel(context.Background())
 	defer cancelTraffic()
-	lifecycleCtx, cancelLifecycle := context.WithCancel(ctx)
-	defer cancelLifecycle()
-	rc := rcon.NewPersistent(cfg.RCONAddress, password, time.Duration(cfg.OperationTimeout))
+	rc := rcon.NewPersistent(cfg.RCONAddress, cfg.RCONPassword, time.Duration(cfg.OperationTimeout))
 	b := &backend.Systemd{Service: cfg.Service, Address: cfg.BackendAddress, Protocol: cfg.Protocol, RCON: rc}
 	defer b.Close()
-	// A direct service restart must not adopt a known-wrong edited password
-	// while a live Java process still uses its original credential. Network
-	// unavailability during normal boot remains the controller's concern.
-	probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(cfg.OperationTimeout))
-	if running, inspectErr := b.Running(probeCtx); inspectErr == nil && running {
-		if _, probeErr := rc.Players(probeCtx); errors.Is(probeErr, rcon.ErrAuthentication) {
-			probeCancel()
-			return fmt.Errorf("MC_RCON_PASSWORD does not authenticate to the running Minecraft server; restore its current value before restarting the gateway")
-		}
+	if err := verifyStartupCredential(ctx, b, time.Duration(cfg.OperationTimeout)); err != nil {
+		return err
 	}
-	probeCancel()
-
 	c := control.New(lifecycleConfig(cfg), b, log)
 	cachePath := filepath.Join(cfg.StateDirectory, "status.json")
-	if cached, err := readCache(cachePath); err == nil {
-		c.SetCachedStatus(cached)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Warn("status_cache_unavailable", "error", err.Error())
-	}
-	if history, err := readBootCache(filepath.Join(cfg.StateDirectory, "boot-history.json")); err == nil {
-		if err := c.RestoreBootHistory(history); err != nil {
-			log.Warn("boot_history_unavailable", "error", err.Error())
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Warn("boot_history_unavailable", "error", err.Error())
-	}
+	restoreCaches(c, cachePath, log)
 	s := gateway.New(trafficConfig(cfg), c, log)
 	runtime := &runtimeConfig{cfg: cfg.Clone(), path: configPath, digest: digest, generation: 1,
 		controller: c, gateway: s, backend: b, level: level, log: log}
-	listener, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
-	defer listener.Close()
-	if err := os.MkdirAll(filepath.Dir(cfg.AdminSocket), 0700); err != nil {
+	daemon := gatewayDaemon{runtime: runtime, cachePath: cachePath, socketPath: cfg.AdminSocket}
+	defer daemon.closeListeners()
+	if err := daemon.listen(ctx, cfg); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(cfg.AdminSocket); err == nil {
-		if info.Mode()&os.ModeSocket == 0 {
-			return fmt.Errorf("admin socket path exists and is not a socket")
-		}
-		if err := os.Remove(cfg.AdminSocket); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if err := runtime.startMetrics(cfg, b); err != nil {
 		return err
 	}
-	admin, err := net.Listen("unix", cfg.AdminSocket)
-	if err != nil {
-		return fmt.Errorf("admin socket: %w", err)
-	}
-	defer admin.Close()
-	defer os.Remove(cfg.AdminSocket)
-	if err := os.Chmod(cfg.AdminSocket, 0600); err != nil {
-		return err
-	}
-	httpServer := &http.Server{Handler: adminHandler(c, s, runtime), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: maxCommandTimeout + 10*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096,
-		BaseContext: func(net.Listener) context.Context { return ctx }}
-	runtime.metrics = telemetry.New(telemetry.Source{
-		Snapshot: func() telemetry.Snapshot {
-			applied, metadata := runtime.snapshot()
-			return telemetry.Snapshot{Lifecycle: c.Snapshot(), Traffic: s.Stats(), IdleTimeout: time.Duration(applied.IdleTimeout), ConfigGeneration: metadata.Generation}
-		}, Command: b.Command, PID: b.MainPID, RCONStats: b.RCONStats, Status: c.CachedStatus,
-	}, version, log)
 	defer runtime.metrics.Close()
-	prepared, err := runtime.metrics.Prepare(metricsConfig(cfg))
-	if err != nil {
-		return fmt.Errorf("metrics startup: %w", err)
-	}
-	prepared.Commit()
+	return daemon.run(ctx, signalCtx, cancelTraffic)
+}
+
+// gatewayDaemon owns the network listeners and worker lifetimes. Minecraft's
+// independently supervised process remains outside this resource group.
+type gatewayDaemon struct {
+	runtime               *runtimeConfig
+	traffic, admin        net.Listener
+	adminHTTP             *http.Server
+	cachePath, socketPath string
+}
+
+func (d *gatewayDaemon) run(ctx, signalCtx context.Context, cancelTraffic context.CancelFunc) error {
+	m := d.runtime
+	lifecycleCtx, cancelLifecycle := context.WithCancel(ctx)
+	defer cancelLifecycle()
 	errCh := make(chan error, 2)
 	lifecycleDone := make(chan struct{})
-	go func() { defer close(lifecycleDone); c.Run(lifecycleCtx) }()
-	go func() { errCh <- s.Serve(ctx, listener) }()
-	go func() { errCh <- httpServer.Serve(admin) }()
+	go func() { defer close(lifecycleDone); m.controller.Run(lifecycleCtx) }()
+	go func() { errCh <- m.gateway.Serve(ctx, d.traffic) }()
+	go func() { errCh <- d.adminHTTP.Serve(d.admin) }()
 	cacheDone := make(chan struct{})
-	go func() { defer close(cacheDone); persistCache(ctx, c, cachePath, log) }()
-	log.Info("gateway_started", "version", version, "listen", cfg.Listen, "backend", cfg.BackendAddress, "idle_timeout", time.Duration(cfg.IdleTimeout).String(), "admin_socket", cfg.AdminSocket)
+	go func() { defer close(cacheDone); persistCache(ctx, m.controller, d.cachePath, m.log) }()
+	cfg, _ := m.snapshot()
+	m.log.Info("gateway_started", "version", version, "listen", cfg.Listen, "backend", cfg.BackendAddress, "idle_timeout", time.Duration(cfg.IdleTimeout).String(), "admin_socket", cfg.AdminSocket)
+	var err error
 	select {
 	case <-signalCtx.Done():
-		runtime.drainForShutdown(cancelLifecycle, lifecycleDone)
+		m.drainForShutdown(cancelLifecycle, lifecycleDone)
 	case err = <-errCh:
 		if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
 		// Startup/component failure is not an operator restart. It must never
 		// kick unrelated players simply because this gateway failed to run.
-		runtime.shuttingDown.Store(true)
+		m.shuttingDown.Store(true)
 		cancelLifecycle()
 	}
 	cancelTraffic()
-	listener.Close()
-	s.Close()
-	applied, _ := runtime.snapshot()
+	d.traffic.Close()
+	m.gateway.Close()
+	applied, _ := m.snapshot()
 	shutdownCtx, done := context.WithTimeout(context.Background(), time.Duration(applied.OperationTimeout))
 	defer done()
-	httpServer.Shutdown(shutdownCtx)
+	d.adminHTTP.Shutdown(shutdownCtx)
 	<-cacheDone
-	log.Info("gateway_stopped", "backend_action", "left_under_separate_supervisor")
+	m.log.Info("gateway_stopped", "backend_action", "left_under_separate_supervisor")
 	return err
-}
-
-// drainForShutdown preserves the established byte streams until the backend
-// itself sends each player's disconnect. It never stops or starts Minecraft.
-// Abrupt process death cannot deliver a message; controlled SIGTERM/SIGINT can.
-func (m *runtimeConfig) drainForShutdown(cancelLifecycle context.CancelFunc, lifecycleDone <-chan struct{}) {
-	m.shuttingDown.Store(true)
-	active := m.gateway.BeginDrain()
-	cancelLifecycle()
-	cfg, _ := m.snapshot()
-	workerCtx, workerCancel := context.WithTimeout(context.Background(), time.Duration(cfg.OperationTimeout))
-	workerStopped := false
-	select {
-	case <-lifecycleDone:
-		workerStopped = true
-	case <-workerCtx.Done():
-	}
-	workerCancel()
-	if m.metrics != nil {
-		_ = m.metrics.Close()
-	}
-	snapshot := m.controller.Snapshot()
-	playersPresent := snapshot.Players != nil && *snapshot.Players > 0
-	messageSent := false
-	if workerStopped && snapshot.State != control.Stopping && (active > 0 || playersPresent) {
-		commandCtx, commandCancel := context.WithTimeout(context.Background(), time.Duration(cfg.OperationTimeout))
-		_, err := m.backend.Command(commandCtx, "kick @a "+cfg.RestartMessage, time.Duration(cfg.OperationTimeout))
-		commandCancel()
-		if err != nil {
-			// Do not expose arbitrary RCON text or config values in the journal.
-			m.log.Warn("gateway_restart_notice_failed", "error", "Minecraft did not acknowledge the native disconnect before the operation timeout")
-		} else {
-			messageSent = true
-		}
-	}
-	graceCtx, graceCancel := context.WithTimeout(context.Background(), time.Duration(cfg.RestartGrace))
-	drained := m.gateway.WaitForRelays(graceCtx) == nil
-	graceCancel()
-	m.log.Info("gateway_drained", "active_relays_at_start", active, "native_disconnect_sent", messageSent, "relays_drained", drained, "lifecycle_stopped", workerStopped)
-}
-
-func readCache(path string) (json.RawMessage, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, 2*1024*1024+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > 2*1024*1024 {
-		return nil, fmt.Errorf("status cache exceeds size limit")
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(b, &obj); err != nil || obj == nil {
-		return nil, fmt.Errorf("invalid status cache")
-	}
-	return b, nil
-}
-
-func persistCache(ctx context.Context, c *control.Controller, path string, log *slog.Logger) {
-	timer := time.NewTicker(10 * time.Second)
-	defer timer.Stop()
-	type cache struct {
-		name, path string
-		read       func() []byte
-		last       []byte
-		lastError  string
-	}
-	caches := []cache{
-		{name: "status_cache", path: path, read: func() []byte { return c.CachedStatus() }},
-		{name: "boot_history", path: filepath.Join(filepath.Dir(path), "boot-history.json"), read: c.CachedBootHistory},
-	}
-	write := func() {
-		for i := range caches {
-			entry := &caches[i]
-			data := entry.read()
-			if len(data) == 0 || bytes.Equal(entry.last, data) {
-				continue
-			}
-			if err := atomicWrite(entry.path, data); err != nil {
-				if err.Error() != entry.lastError {
-					log.Warn(entry.name+"_write_failed", "error", err.Error())
-					entry.lastError = err.Error()
-				}
-				continue
-			}
-			if entry.lastError != "" {
-				log.Info(entry.name + "_recovered")
-				entry.lastError = ""
-			}
-			entry.last = append(entry.last[:0], data...)
-		}
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			write()
-			return
-		case <-timer.C:
-			write()
-		}
-	}
-}
-
-func readBootCache(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 {
-		return nil, errors.New("boot history must be a private regular file")
-	}
-	data, err := io.ReadAll(io.LimitReader(f, 4097))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > 4096 {
-		return nil, errors.New("boot history exceeds size limit")
-	}
-	return data, nil
-}
-
-func atomicWrite(path string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".cache-*")
-	if err != nil {
-		return err
-	}
-	name := f.Name()
-	defer os.Remove(name)
-	if _, err = f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(name, path); err != nil {
-		return err
-	}
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }

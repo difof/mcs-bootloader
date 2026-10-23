@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -368,55 +366,4 @@ func (c *Client) request(conn io.ReadWriter, command string, requestID, endID in
 		}
 	}
 	return "", errors.New("RCON response packet limit exceeded")
-}
-
-var playerList = regexp.MustCompile(`^There are ([0-9]+) of a max of ([0-9]+) players online:\s*(.*)$`)
-var formatting = regexp.MustCompile(`(?i)§[0-9a-fk-or]`)
-
-func parsePlayers(response string) (int, error) {
-	response = strings.TrimSpace(formatting.ReplaceAllString(response, ""))
-	parts := playerList.FindStringSubmatch(response)
-	if len(parts) != 4 {
-		return 0, errors.New("unrecognized RCON player-list response")
-	}
-	count, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, errors.New("invalid RCON player count")
-	}
-	max, err := strconv.Atoi(parts[2])
-	if err != nil || max < 0 || count < 0 {
-		return 0, errors.New("invalid RCON player capacity")
-	}
-	// A supposedly empty list with any unexpected trailing text is ambiguous.
-	if count == 0 && strings.TrimSpace(parts[3]) != "" {
-		return 0, errors.New("contradictory RCON empty-player response")
-	}
-	if count > 0 && strings.TrimSpace(parts[3]) == "" {
-		return 0, errors.New("RCON player names missing from nonempty list")
-	}
-	return count, nil
-}
-
-func (c *Client) Players(ctx context.Context) (int, error) {
-	response, err := c.Command(ctx, "list")
-	if err != nil {
-		return 0, err
-	}
-	return parsePlayers(response)
-}
-
-func isStopReply(response string) bool {
-	response = strings.TrimSpace(formatting.ReplaceAllString(response, ""))
-	return response == "Stopping the server" || response == "Stopping server"
-}
-
-func (c *Client) Stop(ctx context.Context) error {
-	response, err := c.Command(ctx, "stop")
-	if err != nil {
-		return err
-	}
-	if !isStopReply(response) {
-		return errors.New("RCON stop was not acknowledged")
-	}
-	return nil
 }

@@ -9,3 +9,10 @@ import "embed"
 //
 //go:embed .env.example scripts/env_config.py scripts/manage.py scripts/install.py scripts/service_config.py scripts/remove.py deploy/mcs-bootloader.service deploy/mcs-bootloader-backend.service deploy/journald@mcs-bootloader.conf
 var Files embed.FS
+
+// License is available without Python, configuration, or an installed service.
+//
+//go:embed LICENSE
+var License string
+
+const LicenseID = "AGPL-3.0-only"

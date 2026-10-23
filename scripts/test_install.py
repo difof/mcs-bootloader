@@ -1,7 +1,10 @@
 from pathlib import Path
 import json
+import os
+from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 
 import install
 
@@ -164,6 +167,93 @@ class InstallerValidationTests(unittest.TestCase):
                     install.server_directory({"MC_SERVER_DIRECTORY": path})
             with self.assertRaises(FileNotFoundError):
                 install.server_directory({"MC_SERVER_DIRECTORY": str(server / "missing")})
+
+
+class InstallerTransactionTests(unittest.TestCase):
+    def fixture(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        server, units = root / "server", root / "units"
+        server.mkdir()
+        units.mkdir()
+        world = server / "level.dat"
+        world.write_bytes(b"valuable synthetic world; never part of the transaction")
+        account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        props, env = server / "server.properties", root / ".env"
+        props.write_bytes(b"online-mode=true\nwhite-list=true\nlevel-name=world\n")
+        env.write_bytes(b"MC_RCON_PASSWORD=private-transaction-fixture\n")
+        for path in (props, env):
+            path.chmod(0o600)
+            os.utime(path, ns=(1_600_000_000_123_456_789, 1_600_000_001_987_654_321))
+        env_metadata = env.stat()
+        source = install.OriginalFile(env, env.read_bytes(), env_metadata)
+        original = install.original_properties(server, account)
+        plan = install.InstallationPlan(
+            settings=install.RUNTIME_DEFAULTS, source_env=source, properties=original,
+            report_path=root / "report.json", user="minecraft", account=account, group="minecraft",
+            server=server, roots=[root / "tool", root / "config", root / "state"],
+            targets=[units / name for name in ("mcs-bootloader.service", "mcs-bootloader-backend.service",
+                                              "journald@mcs-bootloader.conf", "sudoers")],
+            replacement=install.updated_properties(original.data, "private-transaction-fixture"),
+            binary=b"\x7fELFsynthetic executable")
+        return install.InstallationTransaction(plan), world
+
+    def test_rollback_boundary_preserves_originals_before_activation_and_files_afterward(self):
+        for stage in ("before activation", "activate gateway", "complete"):
+            with self.subTest(stage=stage):
+                transaction, world = self.fixture()
+                plan, calls = transaction.plan, []
+                stopped_checks, report_writes = 0, 0
+                save_report = transaction.save_report
+
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    if stage == "activate gateway" and "enable" in argv:
+                        raise RuntimeError("synthetic activation failure")
+                    return ""
+
+                def stopped(*args):
+                    nonlocal stopped_checks
+                    stopped_checks += 1
+                    if stage == "before activation" and stopped_checks == 2:
+                        raise RuntimeError("synthetic pre-activation failure")
+
+                def save():
+                    nonlocal report_writes
+                    report_writes += 1
+                    if stage == "complete" and report_writes == 2:
+                        raise RuntimeError("synthetic report failure after activation")
+                    save_report()
+
+                with mock.patch.object(install, "run", side_effect=run), \
+                        mock.patch.object(install, "stopped_and_ports_free", side_effect=stopped), \
+                        mock.patch.object(install.os, "chown"), mock.patch.object(install.os, "fchown"), \
+                        mock.patch.object(transaction, "save_report", side_effect=save):
+                    with self.assertRaisesRegex(RuntimeError, "installation failed"):
+                        transaction.run()
+
+                report = json.loads(plan.report_path.read_text())
+                self.assertEqual(report["status"], "failed")
+                if stage == "before activation":
+                    for original in (plan.source_env, plan.properties):
+                        info = original.path.stat()
+                        self.assertFalse(original.path.is_symlink())
+                        self.assertEqual(info.st_mode & 0o777, original.metadata.st_mode & 0o777)
+                        self.assertEqual((info.st_atime_ns, info.st_mtime_ns),
+                                         (original.metadata.st_atime_ns, original.metadata.st_mtime_ns))
+                        self.assertEqual(original.path.read_bytes(), original.data)
+                    self.assertFalse(any(path.exists() for path in plan.roots + plan.targets))
+                    self.assertFalse(any("enable" in argv for argv in calls))
+                    self.assertEqual(sum("daemon-reload" in argv for argv in calls), 2)
+                    self.assertEqual(report["rollback_errors"], [])
+                else:
+                    self.assertTrue(all(path.exists() for path in plan.roots + plan.targets))
+                    self.assertTrue(plan.source_env.path.is_symlink())
+                    self.assertEqual(plan.properties.path.read_bytes(), plan.replacement)
+                    self.assertEqual(sum("daemon-reload" in argv for argv in calls), 1)
+                    self.assertIn("activation began", report["rollback_errors"][0])
+                self.assertEqual(world.read_bytes(), b"valuable synthetic world; never part of the transaction")
 
 
 if __name__ == "__main__":

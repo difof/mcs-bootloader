@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/difof/mcs-bootloader/internal/mcproto"
 )
 
 func TestConfigPrivateBoundary(t *testing.T) {
@@ -21,13 +23,23 @@ func TestConfigPrivateBoundary(t *testing.T) {
 		func(c *Config) { c.BackendAddress = "example.com:25566" },
 		func(c *Config) { c.RCONAddress = c.BackendAddress },
 		func(c *Config) { c.Service = "unit.service;touch bad" },
-		func(c *Config) { c.Protocol = 766 },
+		func(c *Config) { c.Protocol = 999 },
 		func(c *Config) { c.StateDirectory = "." },
 	} {
 		c := good
 		mutate(&c)
 		if c.Validate() == nil {
 			t.Fatalf("unsafe config accepted: %+v", c)
+		}
+	}
+}
+
+func TestConfigAcceptsVerifiedProtocolProfiles(t *testing.T) {
+	for _, protocol := range mcproto.SupportedProtocols() {
+		cfg := DefaultConfig()
+		cfg.Protocol = protocol
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("verified protocol %d rejected: %v", protocol, err)
 		}
 	}
 }
