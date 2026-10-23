@@ -1,0 +1,89 @@
+name: Release
+
+# Only deliberate stable version tags spend runner time. Branches and PRs do not.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref_type == 'tag' && !github.event.deleted
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Validate tag and skip already published releases
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'Expected vMAJOR.MINOR.PATCH without leading zeroes.' >&2
+            exit 1
+          fi
+          if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" >"$RUNNER_TEMP/release.json" 2>"$RUNNER_TEMP/release.err"; then
+            if jq -e '.draft == false' "$RUNNER_TEMP/release.json" >/dev/null; then
+              echo 'Release is already published; preserving its assets and skipping the build.'
+              echo 'exists=true' >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo 'An unpublished draft already exists. Review/recover that draft before rerunning; never move the tag.' >&2
+            exit 1
+          fi
+          if [[ "$(<"$RUNNER_TEMP/release.err")" != *'(HTTP 404)'* ]]; then
+            cat "$RUNNER_TEMP/release.err" >&2
+            exit 1
+          fi
+          echo 'exists=false' >>"$GITHUB_OUTPUT"
+
+      - name: Check out the tagged source
+        if: steps.guard.outputs.exists == 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        if: steps.guard.outputs.exists == 'false'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.x'
+          cache: false # Standard library only; avoid unnecessary Actions storage.
+
+      - name: Validate once on Linux
+        if: steps.guard.outputs.exists == 'false'
+        run: |
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          go test -race -count=1 -timeout=90s ./...
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Build both architectures and package installation files
+        if: steps.guard.outputs.exists == 'false'
+        run: python3 scripts/release.py package --version "$RELEASE_TAG"
+
+      - name: Publish complete release
+        if: steps.guard.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "dist/$RELEASE_TAG/"*.tar.gz \
+            "dist/$RELEASE_TAG/SHA256SUMS" \
+            "dist/$RELEASE_TAG/build-info.json" \
+            --verify-tag --fail-on-no-commits \
+            --title "mcs-bootloader $RELEASE_TAG" \
+            --notes-file "dist/$RELEASE_TAG/RELEASE_NOTES.md" \
+            --generate-notes
