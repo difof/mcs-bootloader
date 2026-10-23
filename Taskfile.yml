@@ -40,12 +40,18 @@ tasks:
     cmds:
       - go test ./internal/mcproto -run '^$' -fuzz '^FuzzReadHandshake$' -fuzztime=10s -parallel=2
   install:
-    desc: First install only; verify stopped server and backup using a private plan
+    desc: First install only; verify stopped server and backup using private .env settings
     cmds:
       - task: check
       - task: build
-      - sudo -n python3 scripts/install.py --plan .local/install.json --report .local/installation.json
+      - mkdir -p .local
+      - sudo -n python3 scripts/install.py --env .env
       - task: config:init
+  migrate:env:
+    desc: Migrate to one private .env; restart gateway once and leave Minecraft running
+    silent: true
+    cmds:
+      - python3 scripts/migrate_env.py {{.CLI_ARGS}}
   deploy:
     desc: Check, build, and install an update; leave running gateway and Java untouched
     cmds:
@@ -75,7 +81,7 @@ tasks:
     cmds:
       - python3 scripts/manage.py stop {{.CLI_ARGS}}
   command:
-    desc: 'Send a local RCON console command: task command -- op PlayerName'
+    desc: 'Send a console command through the private socket: task command -- op PlayerName'
     silent: true
     cmds:
       - python3 scripts/manage.py command --task-args
@@ -100,27 +106,33 @@ tasks:
     cmds:
       - python3 scripts/manage.py logs-server-follow {{.CLI_ARGS}}
   config:init:
-    desc: Create a private .env from installed settings without overwriting an existing file
+    desc: Link project .env to the installed canonical file without copying secrets
     silent: true
     cmds:
       - python3 scripts/manage.py config-init {{.CLI_ARGS}}
   config:edit:
-    desc: Edit .env using VISUAL, EDITOR, or nano
+    desc: Edit the canonical .env using VISUAL, EDITOR, or nano
     silent: true
     cmds:
       - python3 scripts/manage.py config-edit {{.CLI_ARGS}}
   config:show:
-    desc: Show proposed settings from .env (no password contents)
+    desc: Show .env settings and defaults with the password redacted
     silent: true
     cmds:
       - python3 scripts/manage.py config-show {{.CLI_ARGS}}
+  config:live:
+    desc: Show the daemon's applied settings and generation with the password redacted
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-live {{.CLI_ARGS}}
   config:check:
-    desc: Validate .env and protected credentials without changing files or services
+    desc: Validate canonical .env and service-account access without changing files or services
     silent: true
     cmds:
       - python3 scripts/manage.py config-check {{.CLI_ARGS}}
   config:apply:
-    desc: Save validated .env settings atomically; effective after explicit gateway restart
+    aliases: [reload]
+    desc: Apply supported .env changes through the control socket without restarting
     silent: true
     cmds:
       - python3 scripts/manage.py config-apply {{.CLI_ARGS}}
@@ -135,7 +147,7 @@ tasks:
     cmds:
       - python3 scripts/manage.py gateway-stop {{.CLI_ARGS}}
   gateway:restart:
-    desc: Restart gateway to load settings/code; disconnect clients; leave Java running
+    desc: Restart gateway after a code update; disconnect clients; leave Java running
     silent: true
     cmds:
       - python3 scripts/manage.py gateway-restart {{.CLI_ARGS}}

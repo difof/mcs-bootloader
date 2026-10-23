@@ -55,6 +55,31 @@ type Config struct {
 	WakeCooldown      time.Duration
 }
 
+// Validate checks a complete runtime configuration. Reconfiguration never
+// substitutes defaults for missing values, so a bad reload cannot silently
+// shorten a safety timeout.
+func (cfg Config) Validate() error {
+	for _, field := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"idle timeout", cfg.IdleTimeout},
+		{"poll interval", cfg.PollInterval},
+		{"operation timeout", cfg.OperationTimeout},
+		{"startup timeout", cfg.StartupTimeout},
+		{"shutdown warning interval", cfg.ShutdownWarnAfter},
+		{"wake cooldown", cfg.WakeCooldown},
+	} {
+		if field.value <= 0 {
+			return fmt.Errorf("%s must be positive", field.name)
+		}
+	}
+	if cfg.PollInterval > cfg.IdleTimeout {
+		return errors.New("poll interval must not exceed idle timeout")
+	}
+	return nil
+}
+
 type Snapshot struct {
 	State               State     `json:"state"`
 	Players             *int      `json:"players"`
@@ -71,9 +96,18 @@ type Snapshot struct {
 }
 
 type request struct {
-	ctx   context.Context
-	sleep bool
-	reply chan error
+	ctx           context.Context
+	sleep         bool
+	reply         chan error
+	configuration *configurationRequest
+}
+
+type configurationRequest struct {
+	cfg          Config
+	beforeCommit func() error
+	// 0: queued; 1: accepted by the worker; 2: cancelled before acceptance.
+	// The caller and worker race only for acceptance, never over cfg itself.
+	phase atomic.Uint32
 }
 
 // Controller has one worker for backend operations. Its small mutex protects
@@ -136,6 +170,32 @@ func (c *Controller) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case r := <-c.reqs:
+			if update := r.configuration; update != nil {
+				if err := r.ctx.Err(); err != nil {
+					update.phase.CompareAndSwap(0, 2)
+					r.reply <- err
+					continue
+				}
+				if !update.phase.CompareAndSwap(0, 1) {
+					r.reply <- r.ctx.Err()
+					continue
+				}
+				if update.beforeCommit != nil {
+					if err := update.beforeCommit(); err != nil {
+						r.reply <- err
+						continue
+					}
+				}
+				// A configuration commit has no external I/O. Preserve state,
+				// leases, and the existing idle timestamp across the change.
+				pollChanged := c.cfg.PollInterval != update.cfg.PollInterval
+				c.cfg = update.cfg
+				if pollChanged {
+					ticker.Reset(c.cfg.PollInterval)
+				}
+				r.reply <- nil
+				continue
+			}
 			if err := r.ctx.Err(); err != nil {
 				r.reply <- err
 				continue
@@ -155,6 +215,62 @@ func (c *Controller) Run(ctx context.Context) {
 
 func (c *Controller) Wake(ctx context.Context) error  { return c.submit(ctx, false) }
 func (c *Controller) Sleep(ctx context.Context) error { return c.submit(ctx, true) }
+
+// Reconfigure serializes a validated update with all lifecycle operations.
+// Cancellation before worker acceptance prevents the update. Once accepted,
+// this call waits for its acknowledgement even if ctx expires, so an error
+// never leaves callers guessing whether configuration was committed.
+func (c *Controller) Reconfigure(ctx context.Context, cfg Config) error {
+	return c.ReconfigureWith(ctx, cfg, nil)
+}
+
+// ReconfigureWith runs a precommit hook on the lifecycle worker, excluding
+// wake, sleep, and poll operations while related runtime settings are updated.
+// The hook must use bounded I/O, must not call back into the controller's
+// worker, and must leave its own state unchanged if it returns an error.
+// Once accepted, cancellation waits for the hook and definitive commit result.
+func (c *Controller) ReconfigureWith(ctx context.Context, cfg Config, beforeCommit func() error) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !c.started.Load() {
+		return ErrNotRunning
+	}
+	update := &configurationRequest{cfg: cfg, beforeCommit: beforeCommit}
+	r := request{ctx: ctx, reply: make(chan error, 1), configuration: update}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return ErrNotRunning
+	case c.reqs <- r:
+	default:
+		return ErrQueueFull
+	}
+	for {
+		select {
+		case err := <-r.reply:
+			return err
+		case <-ctx.Done():
+			if update.phase.CompareAndSwap(0, 2) {
+				return ctx.Err()
+			}
+			// An accepted commit is synchronous on the worker. Its buffered
+			// acknowledgement is delivered before the worker can exit.
+			return <-r.reply
+		case <-c.done:
+			select {
+			case err := <-r.reply:
+				return err
+			default:
+				return ErrNotRunning
+			}
+		}
+	}
+}
 
 func (c *Controller) submit(ctx context.Context, sleep bool) error {
 	if !c.started.Load() {

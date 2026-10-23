@@ -30,7 +30,7 @@ func gracefulBackendStop(cfg backend.Config, pid int) error {
 	if err != nil {
 		return err
 	}
-	password, err := backend.ReadPassword(cfg.RCONPasswordFile)
+	password, err := cfg.Password()
 	if err != nil {
 		return err
 	}

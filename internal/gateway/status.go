@@ -10,12 +10,16 @@ import (
 // status edits only lifecycle display fields. Unknown top-level and nested
 // fields are retained as raw JSON, including NeoForge/modpack extensions.
 func (s *Server) status() json.RawMessage {
+	return s.statusWithConfig(*s.cfg.Load())
+}
+
+func (s *Server) statusWithConfig(cfg Config) json.RawMessage {
 	raw := s.controller.CachedStatus()
 	var status map[string]json.RawMessage
 	if json.Unmarshal(raw, &status) != nil || status == nil {
-		if json.Unmarshal(s.cfg.FallbackStatus, &status) != nil || status == nil {
+		if json.Unmarshal(cfg.FallbackStatus, &status) != nil || status == nil {
 			status = map[string]json.RawMessage{
-				"version":     json.RawMessage(fmt.Sprintf(`{"name":"Minecraft","protocol":%d}`, s.cfg.Protocol)),
+				"version":     json.RawMessage(fmt.Sprintf(`{"name":"Minecraft","protocol":%d}`, cfg.Protocol)),
 				"players":     json.RawMessage(`{"max":20,"online":0}`),
 				"description": json.RawMessage(`{"text":"Minecraft server"}`),
 			}
@@ -27,12 +31,12 @@ func (s *Server) status() json.RawMessage {
 			setPlayerCount(status, *snapshot.Players, false)
 		}
 	} else {
-		message := s.cfg.FailedMOTD
+		message := cfg.FailedMOTD
 		switch snapshot.State {
 		case control.Asleep:
-			message = s.cfg.SleepingMOTD
+			message = cfg.SleepingMOTD
 		case control.Starting:
-			message = s.cfg.StartingMOTD
+			message = cfg.StartingMOTD
 		case control.Stopping:
 			message = "Server is saving and going to sleep. Please reconnect shortly."
 		case control.Unknown:

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,7 +33,7 @@ var (
 type Client struct {
 	address  string
 	password string
-	timeout  time.Duration
+	timeout  atomic.Int64
 	// Only persistent clients use the fields below. gate protects their entire
 	// exchange, connection lifecycle, request IDs, and closed flag.
 	persistent bool
@@ -46,7 +47,21 @@ func New(address, password string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return &Client{address: address, password: password, timeout: timeout}
+	c := &Client{address: address, password: password}
+	c.timeout.Store(int64(timeout))
+	return c
+}
+
+// Address is immutable for the lifetime of a client.
+func (c *Client) Address() string { return c.address }
+
+// SetTimeout changes the default for future requests without interrupting an
+// exchange already in progress or reconnecting a healthy persistent session.
+func (c *Client) SetTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		panic("RCON timeout must be positive")
+	}
+	c.timeout.Store(int64(timeout))
 }
 
 // NewPersistent reuses one authenticated connection for sequential requests.
@@ -140,13 +155,22 @@ func readPacket(r io.Reader) (packet, error) {
 // This avoids timing guesses and never interprets a partial list as zero players.
 // Its response is consumed by ID and never reaches the caller or logs.
 func (c *Client) Command(ctx context.Context, command string) (string, error) {
+	return c.CommandWithTimeout(ctx, command, time.Duration(c.timeout.Load()))
+}
+
+// CommandWithTimeout uses the same serialized connection with a per-operation
+// deadline. Operator commands can take longer than a routine health check.
+func (c *Client) CommandWithTimeout(ctx context.Context, command string, timeout time.Duration) (string, error) {
 	if c.password == "" {
 		return "", errors.New("RCON password is empty")
 	}
 	if command == "" || strings.ContainsAny(command, "\x00\r\n") {
 		return "", errors.New("invalid RCON command")
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	if timeout <= 0 {
+		return "", errors.New("RCON timeout must be positive")
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if c.persistent {
 		return c.persistentCommand(ctx, command)

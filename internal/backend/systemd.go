@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"mc-gateway/internal/mcproto"
 	"mc-gateway/internal/rcon"
@@ -17,6 +19,7 @@ type Systemd struct {
 	Address  string
 	Protocol int
 	RCON     *rcon.Client
+	mu       sync.RWMutex
 }
 
 func (s *Systemd) Start(ctx context.Context) error {
@@ -57,8 +60,42 @@ func (s *Systemd) Running(ctx context.Context) (bool, error) {
 	}
 }
 
-func (s *Systemd) Players(ctx context.Context) (int, error) { return s.RCON.Players(ctx) }
-func (s *Systemd) Stop(ctx context.Context) error           { return s.RCON.Stop(ctx) }
+func (s *Systemd) Players(ctx context.Context) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.RCON.Players(ctx)
+}
+func (s *Systemd) Stop(ctx context.Context) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.RCON.Stop(ctx)
+}
+func (s *Systemd) Command(ctx context.Context, command string, timeout time.Duration) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.RCON.CommandWithTimeout(ctx, command, timeout)
+}
+
+// ReconfigureRCON is called by the serialized lifecycle worker. A password
+// change must first establish that the backend is stopped. Active commands
+// finish before replacement, and healthy connections survive timeout changes.
+func (s *Systemd) ReconfigureRCON(password string, timeout time.Duration, replace bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if replace {
+		old := s.RCON
+		s.RCON = rcon.NewPersistent(old.Address(), password, timeout)
+		_ = old.Close()
+	} else {
+		s.RCON.SetTimeout(timeout)
+	}
+}
+
+func (s *Systemd) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.RCON.Close()
+}
 func (s *Systemd) Status(ctx context.Context) (json.RawMessage, error) {
 	return mcproto.QueryStatus(ctx, s.Address, s.Protocol)
 }

@@ -22,19 +22,15 @@ import (
 	"mc-gateway/internal/rcon"
 )
 
-func serve(cfg backend.Config) error {
-	level := slog.LevelInfo
-	if cfg.LogLevel == "debug" {
-		level = slog.LevelDebug
-	}
-	if cfg.LogLevel == "warn" {
-		level = slog.LevelWarn
-	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-	password, err := backend.ReadPassword(cfg.RCONPasswordFile)
+func serve(configPath string) error {
+	cfg, digest, err := readConfigSnapshot(configPath)
 	if err != nil {
 		return err
 	}
+	level := new(slog.LevelVar)
+	level.Set(parseLogLevel(cfg.LogLevel))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	password := cfg.RCONPassword
 	if err := os.MkdirAll(cfg.StateDirectory, 0700); err != nil {
 		return err
 	}
@@ -50,28 +46,30 @@ func serve(cfg backend.Config) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	rc := rcon.NewPersistent(cfg.RCONAddress, password, time.Duration(cfg.OperationTimeout))
-	defer rc.Close()
 	b := &backend.Systemd{Service: cfg.Service, Address: cfg.BackendAddress, Protocol: cfg.Protocol, RCON: rc}
-	c := control.New(control.Config{
-		IdleTimeout: time.Duration(cfg.IdleTimeout), PollInterval: time.Duration(cfg.PollInterval), OperationTimeout: time.Duration(cfg.OperationTimeout),
-		StartupTimeout: time.Duration(cfg.StartupTimeout), ShutdownWarnAfter: time.Duration(cfg.ShutdownWarnAfter), WakeCooldown: time.Duration(cfg.WakeCooldown),
-	}, b, log)
+	defer b.Close()
+	// A direct service restart must not adopt a known-wrong edited password
+	// while a live Java process still uses its original credential. Network
+	// unavailability during normal boot remains the controller's concern.
+	probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(cfg.OperationTimeout))
+	if running, inspectErr := b.Running(probeCtx); inspectErr == nil && running {
+		if _, probeErr := rc.Players(probeCtx); errors.Is(probeErr, rcon.ErrAuthentication) {
+			probeCancel()
+			return fmt.Errorf("MC_RCON_PASSWORD does not authenticate to the running Minecraft server; restore its current value before restarting the gateway")
+		}
+	}
+	probeCancel()
+
+	c := control.New(lifecycleConfig(cfg), b, log)
 	cachePath := filepath.Join(cfg.StateDirectory, "status.json")
 	if cached, err := readCache(cachePath); err == nil {
 		c.SetCachedStatus(cached)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		log.Warn("status_cache_unavailable", "error", err.Error())
 	}
-	fallback, _ := json.Marshal(map[string]any{
-		"version":     map[string]any{"name": cfg.Version, "protocol": cfg.Protocol},
-		"players":     map[string]any{"max": cfg.MaxPlayers, "online": 0, "sample": []any{}},
-		"description": cfg.SleepingMOTD, "isModded": true,
-	})
-	s := gateway.New(gateway.Config{
-		BackendAddress: cfg.BackendAddress, Protocol: cfg.Protocol, MaxConnections: cfg.MaxConnections,
-		HandshakeTimeout: time.Duration(cfg.HandshakeTimeout), DialTimeout: time.Duration(cfg.DialTimeout),
-		BootMessage: cfg.BootMessage, SleepingMOTD: cfg.SleepingMOTD, StartingMOTD: cfg.StartingMOTD, FailedMOTD: cfg.FailedMOTD, FallbackStatus: fallback,
-	}, c, log)
+	s := gateway.New(trafficConfig(cfg), c, log)
+	runtime := &runtimeConfig{cfg: cfg, path: configPath, digest: digest, generation: 1,
+		controller: c, gateway: s, backend: b, level: level, log: log}
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
@@ -99,7 +97,7 @@ func serve(cfg backend.Config) error {
 	if err := os.Chmod(cfg.AdminSocket, 0600); err != nil {
 		return err
 	}
-	httpServer := &http.Server{Handler: adminHandler(c, s), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096}
+	httpServer := &http.Server{Handler: adminHandler(c, s, runtime), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: maxCommandTimeout + 10*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096}
 	errCh := make(chan error, 2)
 	go c.Run(ctx)
 	go func() { errCh <- s.Serve(ctx, listener) }()

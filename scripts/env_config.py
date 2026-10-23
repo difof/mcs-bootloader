@@ -1,9 +1,9 @@
 """Read gateway .env settings as data, without a shell or environment expansion.
 
 ``read_env`` returns only settings explicitly present in the file. Integer
-settings become Python ints; all other settings remain strings. ``render_config``
-overlays these settings on installed JSON, so omitted settings retain their
-installed values. Callers can merge ``MANAGE_DEFAULTS`` for task-only options.
+settings become Python ints; all other settings remain strings. The same file is
+read directly by the Go daemon and the task helper. It is never sourced in a
+shell, exported to subprocesses, or rendered into a second active config file.
 
 Supported syntax is KEY=value, optional ``export``, comments, single-quoted
 literal strings, and JSON double-quoted strings. A physical line always contains
@@ -23,10 +23,14 @@ CONFIG_KEYS = {
     "MC_LISTEN": "listen",
     "MC_BACKEND_ADDRESS": "backend_address",
     "MC_RCON_ADDRESS": "rcon_address",
-    "MC_RCON_PASSWORD_FILE": "rcon_password_file",
+    "MC_RCON_PASSWORD": "rcon_password",
     "MC_BACKEND_SERVICE": "backend_service",
     "MC_STATE_DIRECTORY": "state_directory",
     "MC_ADMIN_SOCKET": "admin_socket",
+    "MC_SERVER_DIRECTORY": "server_directory",
+    "MC_JAVA_BINARY": "java_binary",
+    "MC_JVM_ARGFILE": "jvm_argfile",
+    "MC_SERVER_ARGFILE": "server_argfile",
     "MC_PROTOCOL": "protocol",
     "MC_VERSION": "version",
     "MC_MAX_PLAYERS": "max_players",
@@ -46,14 +50,46 @@ CONFIG_KEYS = {
     "MC_LOG_LEVEL": "log_level",
 }
 
+# Match backend.DefaultConfig. Host-specific loader arguments and credentials
+# have no usable default; installation supplies them in the private .env.
+RUNTIME_DEFAULTS = {
+    "MC_LISTEN": ":25565",
+    "MC_BACKEND_ADDRESS": "127.0.0.1:25566",
+    "MC_RCON_ADDRESS": "127.0.0.1:25575",
+    "MC_BACKEND_SERVICE": "mc-gateway-backend.service",
+    "MC_STATE_DIRECTORY": "/var/lib/mc-gateway",
+    "MC_ADMIN_SOCKET": "/run/mc-gateway/control.sock",
+    "MC_SERVER_DIRECTORY": "/srv/minecraft",
+    "MC_JAVA_BINARY": "/usr/bin/java",
+    "MC_JVM_ARGFILE": "@user_jvm_args.txt",
+    "MC_PROTOCOL": 767,
+    "MC_VERSION": "1.21.1",
+    "MC_MAX_PLAYERS": 5,
+    "MC_MAX_CONNECTIONS": 64,
+    "MC_IDLE_TIMEOUT": "1h",
+    "MC_POLL_INTERVAL": "15s",
+    "MC_OPERATION_TIMEOUT": "5s",
+    "MC_STARTUP_TIMEOUT": "15m",
+    "MC_SHUTDOWN_WARN_AFTER": "3m",
+    "MC_WAKE_COOLDOWN": "30s",
+    "MC_HANDSHAKE_TIMEOUT": "5s",
+    "MC_DIAL_TIMEOUT": "3s",
+    "MC_BOOT_MESSAGE": "Server is booting up. Please reconnect in a few minutes.",
+    "MC_SLEEPING_MOTD": "Server is sleeping. Join to start it.",
+    "MC_STARTING_MOTD": "Server is booting up. Please wait...",
+    "MC_FAILED_MOTD": "Server is unavailable. Please try again shortly.",
+    "MC_LOG_LEVEL": "info",
+}
+
 MANAGE_DEFAULTS = {
     "MC_BINARY": "/opt/mc-gateway/bin/mc-gateway",
-    "MC_CONFIG": "/etc/mc-gateway/config.json",
+    "MC_CONFIG": "/etc/mc-gateway/.env",
     "MC_SERVICE_USER": "minecraft",
     "MC_GATEWAY_SERVICE": "mc-gateway.service",
     "MC_LOG_NAMESPACE": "mc-gateway",
     "MC_LOG_LINES": 100,
     "MC_COMMAND_TIMEOUT": "30s",
+    "MC_BACKUP_DIRECTORY": "/srv/minecraft-backups/pre-gateway",
 }
 
 INTEGER_KEYS = frozenset({
@@ -199,7 +235,7 @@ def read_env(path):
 
 
 def render_config(values, base_dict):
-    """Overlay supplied gateway settings on a copy of installed JSON settings."""
+    """Map dotenv fields for migration/tests; never persist an active JSON copy."""
     if not isinstance(base_dict, Mapping):
         _error("base configuration must be a mapping")
     result = dict(base_dict)
@@ -210,7 +246,7 @@ def render_config(values, base_dict):
 
 
 def values_from_config(base_dict, *, include_manage_defaults=True):
-    """Map installed JSON to .env values, optionally adding task defaults.
+    """Map runtime fields to .env values, optionally adding task defaults.
 
     No runtime defaults are invented: absent JSON fields remain absent. Unknown
     JSON fields are rejected so a future configuration cannot be silently lost.
@@ -223,6 +259,18 @@ def values_from_config(base_dict, *, include_manage_defaults=True):
     values = dict(MANAGE_DEFAULTS) if include_manage_defaults else {}
     values.update({reverse[field]: value for field, value in base_dict.items()})
     return validate_values(values)
+
+
+def redacted_values(values):
+    """Return effective local settings safe to display, without the credential.
+
+    These describe the file, which may still await ``task config:apply``. Missing
+    required startup settings remain absent so no invented path is presented as
+    an installed Minecraft loader.
+    """
+    result = {**RUNTIME_DEFAULTS, **MANAGE_DEFAULTS, **validate_values(values)}
+    result["MC_RCON_PASSWORD"] = "[REDACTED]"
+    return {key: result[key] for key in (*CONFIG_KEYS, *MANAGE_DEFAULTS) if key in result}
 
 
 def serialize_env(values):

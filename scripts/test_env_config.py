@@ -65,6 +65,7 @@ class EnvConfigTests(unittest.TestCase):
             "MC_BOOT_MESSAGE": 'It\'s "quoted" # $HOME `true` $(true) \\ path\nNext line',
             "MC_VERSION": " version with spaces ",
             "MC_PROTOCOL": 767,
+            "MC_RCON_PASSWORD": ' private # $HOME `true` $(true) " \\ password ',
         }
         self.assertEqual(self.read(env_config.serialize_env(values)), values)
 
@@ -72,24 +73,30 @@ class EnvConfigTests(unittest.TestCase):
         source = (ROOT / "internal/backend/config.go").read_text()
         struct = re.search(r"type Config struct \{(.*?)\n\}", source, re.DOTALL)
         self.assertIsNotNone(struct)
-        fields = set(re.findall(r'json:"([a-z_]+)"', struct.group(1)))
+        fields = set(re.findall(r'json:"([a-z_]+)(?:,[^"]*)?"', struct.group(1)))
+        # The legacy password-file field is only for migration compatibility;
+        # the inline password deliberately has no Go JSON representation.
+        fields.discard("rcon_password_file")
+        fields.add("rcon_password")
         self.assertEqual(set(env_config.CONFIG_KEYS.values()), fields)
         self.assertEqual(len(env_config.CONFIG_KEYS), len(fields))
 
-    def test_example_covers_every_setting_and_matches_runtime_example(self):
+    def test_example_covers_every_setting_and_matches_safe_defaults(self):
         values = env_config.read_env(ROOT / ".env.example")
         self.assertEqual(set(values), env_config.SUPPORTED_KEYS)
-        expected = json.loads((ROOT / "deploy/config.example.json").read_text())
-        self.assertEqual(env_config.render_config(values, {}), expected)
+        self.assertEqual({key: values[key] for key in env_config.RUNTIME_DEFAULTS},
+                         env_config.RUNTIME_DEFAULTS)
         self.assertEqual({key: values[key] for key in env_config.MANAGE_DEFAULTS},
                          env_config.MANAGE_DEFAULTS)
 
-    def test_config_overlay_preserves_installed_values_and_excludes_task_options(self):
-        original = json.loads((ROOT / "deploy/config.example.json").read_text())
-        original.update({"listen": ":25590", "max_players": 23, "version": "Friends modpack"})
+        self.assertEqual(values["MC_CONFIG"], "/etc/mc-gateway/.env")
+        self.assertNotIn("MC_RCON_PASSWORD_FILE", values)
+
+    def test_config_mapping_preserves_base_values_and_excludes_task_options(self):
+        original = {"listen": ":25590", "max_players": 23, "version": "Friends modpack"}
         snapshot = dict(original)
         values = {"MC_IDLE_TIMEOUT": "2h", "MC_BOOT_MESSAGE": "Waking up",
-                  "MC_LOG_LINES": "250", "MC_CONFIG": "/etc/example/gateway.json"}
+                  "MC_LOG_LINES": "250", "MC_CONFIG": "/etc/example/.env"}
         result = env_config.render_config(values, original)
         self.assertEqual(original, snapshot)
         expected = {**snapshot, "idle_timeout": "2h", "boot_message": "Waking up"}
@@ -97,10 +104,9 @@ class EnvConfigTests(unittest.TestCase):
         self.assertEqual(values["MC_LOG_LINES"], "250")
         self.assertIsNot(result, original)
 
-    def test_seed_from_installed_config_is_lossless(self):
-        original = json.loads((ROOT / "deploy/config.example.json").read_text())
-        original["max_players"] = 19
-        original["boot_message"] = "One\nTwo $HOME"
+    def test_seed_from_runtime_fields_is_lossless(self):
+        original = {"max_players": 19, "boot_message": "One\nTwo $HOME",
+                    "rcon_password": "synthetic-private-password"}
         values = env_config.values_from_config(original)
         self.assertEqual(env_config.render_config(self.read(env_config.serialize_env(values)), {}), original)
         self.assertEqual({key: values[key] for key in env_config.MANAGE_DEFAULTS},
@@ -109,13 +115,28 @@ class EnvConfigTests(unittest.TestCase):
                                                         include_manage_defaults=False)
         self.assertEqual(without_defaults, {"MC_VERSION": "custom"})
 
+    def test_display_redacts_password_and_includes_effective_defaults(self):
+        secret = "DO_NOT_DISPLAY_THIS_SECRET"
+        values = {"MC_RCON_PASSWORD": secret, "MC_IDLE_TIMEOUT": "2h"}
+        displayed = env_config.redacted_values(values)
+        self.assertEqual(displayed["MC_RCON_PASSWORD"], "[REDACTED]")
+        self.assertEqual(displayed["MC_IDLE_TIMEOUT"], "2h")
+        self.assertEqual(displayed["MC_ADMIN_SOCKET"], "/run/mc-gateway/control.sock")
+        self.assertEqual(displayed["MC_CONFIG"], "/etc/mc-gateway/.env")
+        self.assertNotIn(secret, json.dumps(displayed))
+        self.assertEqual(values["MC_RCON_PASSWORD"], secret)
+        self.assertNotIn("MC_SERVER_ARGFILE", env_config.redacted_values({}))
+
     def test_duplicate_unknown_and_syntax_errors_never_echo_values(self):
         secret = "DO_NOT_ECHO_THIS_VALUE"
         cases = (
             (f"MC_VERSION=first\nMC_VERSION={secret}\n", "line 2: MC_VERSION: duplicate"),
             (f"MC_UNKNOWN={secret}\n", "line 1: MC_UNKNOWN: unknown"),
             (f"PATH={secret}\n", "line 1: PATH: unknown"),
-            (f"MC_RCON_PASSWORD={secret}\n", "line 1: MC_RCON_PASSWORD: unknown"),
+            (f"MC_RCON_PASSWORD_FILE={secret}\n", "line 1: MC_RCON_PASSWORD_FILE: unknown"),
+            (f"MC_RCON_PASSWORD=first\nMC_RCON_PASSWORD={secret}\n",
+             "line 2: MC_RCON_PASSWORD: duplicate"),
+            (f'MC_RCON_PASSWORD="{secret}\\q"\n', "line 1: MC_RCON_PASSWORD: invalid JSON"),
             (f"= {secret}\n", "line 1: expected"),
             (f"{secret} is not an assignment\n", "line 1: expected"),
             (f"MC_VERSION='{secret}'suffix\n", "line 1: MC_VERSION: unexpected"),
@@ -134,6 +155,7 @@ class EnvConfigTests(unittest.TestCase):
             'MC_VERSION="   "\n', "MC_BOOT_MESSAGE='first\nsecond'\n",
             'MC_BOOT_MESSAGE="first\nsecond"\n',
             'MC_VERSION="first\\nsecond"\n',
+            'MC_RCON_PASSWORD="first\\nsecond"\n',
             'MC_BOOT_MESSAGE="first\\rsecond"\n',
             'MC_BOOT_MESSAGE="first\\u0000second"\n',
             'MC_BOOT_MESSAGE="first\\bsecond"\n',

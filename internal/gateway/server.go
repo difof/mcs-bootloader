@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,40 @@ type Config struct {
 	FallbackStatus   json.RawMessage
 }
 
+// Validate checks a complete configuration without applying defaults. The
+// startup-only backend address and protocol are additionally pinned by Server.
+func (cfg Config) Validate() error {
+	host, port, err := net.SplitHostPort(cfg.BackendAddress)
+	if err != nil || host == "" {
+		return errors.New("backend address must contain a host and port")
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return errors.New("backend port must be between 1 and 65535")
+	}
+	if cfg.Protocol <= 0 {
+		return errors.New("protocol must be positive")
+	}
+	if cfg.MaxConnections < 1 || cfg.MaxConnections > 4096 {
+		return errors.New("maximum connections must be between 1 and 4096")
+	}
+	if cfg.HandshakeTimeout <= 0 || cfg.DialTimeout <= 0 {
+		return errors.New("handshake and dial timeouts must be positive")
+	}
+	for _, message := range []string{cfg.BootMessage, cfg.SleepingMOTD, cfg.StartingMOTD, cfg.FailedMOTD} {
+		if len(message) == 0 || len(message) > 4096 {
+			return errors.New("messages must contain 1-4096 bytes")
+		}
+	}
+	if len(cfg.FallbackStatus) > 0 {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(cfg.FallbackStatus, &obj); err != nil || obj == nil {
+			return errors.New("fallback status must be a JSON object")
+		}
+	}
+	return nil
+}
+
 // Stats are aggregate counters, intentionally replacing noisy per-ping and
 // malformed-request log messages. They never include client payloads.
 type Stats struct {
@@ -58,7 +93,7 @@ type counters struct {
 }
 
 type Server struct {
-	cfg                       Config
+	cfg                       atomic.Pointer[Config]
 	controller                Controller
 	log                       *slog.Logger
 	stats                     counters
@@ -102,7 +137,36 @@ func New(cfg Config, controller Controller, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, controller: controller, log: logger, connections: make(map[net.Conn]struct{})}
+	s := &Server{controller: controller, log: logger, connections: make(map[net.Conn]struct{})}
+	cfg.FallbackStatus = append(json.RawMessage(nil), cfg.FallbackStatus...)
+	s.cfg.Store(&cfg)
+	return s
+}
+
+// ConfigSnapshot returns a private copy; callers cannot mutate live fallback
+// metadata through the returned JSON byte slice.
+func (s *Server) ConfigSnapshot() Config {
+	cfg := *s.cfg.Load()
+	cfg.FallbackStatus = append(json.RawMessage(nil), cfg.FallbackStatus...)
+	return cfg
+}
+
+// Reconfigure publishes an immutable configuration for subsequent admissions.
+// Existing relays keep their connections, including when the limit is lowered
+// below their current count. Address and protocol changes require a restart.
+func (s *Server) Reconfigure(cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	cfg.FallbackStatus = append(json.RawMessage(nil), cfg.FallbackStatus...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.cfg.Load()
+	if cfg.BackendAddress != current.BackendAddress || cfg.Protocol != current.Protocol {
+		return errors.New("backend address and protocol cannot change at runtime")
+	}
+	s.cfg.Store(&cfg)
+	return nil
 }
 
 func (s *Server) Stats() Stats {
@@ -124,9 +188,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		listener.Close()
 		return errors.New("nil controller")
 	}
-	if _, _, err := net.SplitHostPort(s.cfg.BackendAddress); err != nil {
+	if err := s.cfg.Load().Validate(); err != nil {
 		listener.Close()
-		return fmt.Errorf("invalid backend address: %w", err)
+		return fmt.Errorf("invalid gateway configuration: %w", err)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -141,7 +205,6 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	stopClose := context.AfterFunc(ctx, func() { _ = s.Close() })
 	defer stopClose()
 	defer func() { _ = s.Close(); s.wg.Wait() }()
-	sem := make(chan struct{}, s.cfg.MaxConnections)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -151,27 +214,28 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 			return fmt.Errorf("accept client: %w", err)
 		}
 		s.stats.accepted.Add(1)
-		select {
-		case sem <- struct{}{}:
-		default:
-			s.stats.capacityRejected.Add(1)
-			conn.Close()
-			continue
-		}
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
-			<-sem
 			conn.Close()
 			return nil
+		}
+		// The same lock serializes limit publication with new admissions.
+		// Each connection keeps one config snapshot through its handshake.
+		cfg := *s.cfg.Load()
+		if len(s.connections) >= cfg.MaxConnections {
+			s.mu.Unlock()
+			s.stats.capacityRejected.Add(1)
+			conn.Close()
+			continue
 		}
 		s.connections[conn] = struct{}{}
 		s.wg.Add(1)
 		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
-			defer func() { <-sem; conn.Close(); s.mu.Lock(); delete(s.connections, conn); s.mu.Unlock() }()
-			s.handle(ctx, conn)
+			defer func() { conn.Close(); s.mu.Lock(); delete(s.connections, conn); s.mu.Unlock() }()
+			s.handle(ctx, conn, cfg)
 		}()
 	}
 }
@@ -201,9 +265,9 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) handle(ctx context.Context, conn net.Conn) {
+func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 	setKeepAlive(conn)
-	_ = conn.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
+	_ = conn.SetDeadline(time.Now().Add(cfg.HandshakeTimeout))
 	handshake, err := mcproto.ReadHandshake(conn)
 	if err != nil {
 		s.stats.invalidRequests.Add(1)
@@ -213,7 +277,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	if handshake.NextState == 1 {
 		s.stats.statusRequests.Add(1)
 		// The status handler has a bounded deadline, including its optional ping.
-		_ = mcproto.HandleStatus(conn, s.status())
+		_ = mcproto.HandleStatus(conn, s.statusWithConfig(cfg))
 		return
 	}
 	if handshake.NextState != 2 && handshake.NextState != 3 {
@@ -232,31 +296,31 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		before := s.controller.Snapshot()
 		if before.State != control.Ready && s.limiter.allow(clientHost(conn), time.Now()) {
 			s.stats.wakeRequests.Add(1)
-			wakeCtx, cancel := context.WithTimeout(ctx, s.cfg.HandshakeTimeout)
+			wakeCtx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
 			_ = s.controller.Wake(wakeCtx)
 			cancel()
 		} else if before.State != control.Ready {
 			s.stats.wakeLimited.Add(1)
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, s.disconnectMessage(s.controller.Snapshot().State))
+		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, disconnectMessage(cfg, s.controller.Snapshot().State))
 		return
 	}
 	defer release()
-	dialer := net.Dialer{Timeout: s.cfg.DialTimeout, KeepAlive: 30 * time.Second}
-	backend, err := dialer.DialContext(ctx, "tcp", s.cfg.BackendAddress)
+	dialer := net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}
+	backend, err := dialer.DialContext(ctx, "tcp", cfg.BackendAddress)
 	if err != nil {
 		s.stats.backendErrors.Add(1)
 		s.logBackendError("backend_connect_failed", err)
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, s.cfg.FailedMOTD)
+		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, cfg.FailedMOTD)
 		return
 	}
 	defer backend.Close()
 	setKeepAlive(backend)
 	stopClose := context.AfterFunc(ctx, func() { backend.Close(); conn.Close() })
 	defer stopClose()
-	_ = backend.SetWriteDeadline(time.Now().Add(s.cfg.DialTimeout))
+	_ = backend.SetWriteDeadline(time.Now().Add(cfg.DialTimeout))
 	if err = writeAll(backend, handshake.Raw); err == nil {
 		err = writeAll(backend, login)
 	}
@@ -280,16 +344,16 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	s.log.Info("connection_closed", args...)
 }
 
-func (s *Server) disconnectMessage(state control.State) string {
+func disconnectMessage(cfg Config, state control.State) string {
 	switch state {
 	case control.Asleep, control.Starting:
-		return s.cfg.BootMessage
+		return cfg.BootMessage
 	case control.Stopping:
 		return "Server is saving and shutting down. Please reconnect shortly."
 	case control.Unknown:
 		return "Server health is being checked. Please reconnect shortly."
 	default:
-		return s.cfg.FailedMOTD
+		return cfg.FailedMOTD
 	}
 }
 

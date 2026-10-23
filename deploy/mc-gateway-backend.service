@@ -6,11 +6,10 @@ After=network.target
 Type=exec
 User=minecraft
 Group=minecraft
-WorkingDirectory=/srv/minecraft
-EnvironmentFile=/etc/mc-gateway/backend.env
+WorkingDirectory=/
 # Use the existing JVM arguments and installed loader. No restart shell loop.
-ExecStart=/usr/bin/java @user_jvm_args.txt ${MC_SERVER_ARGFILE} nogui
-ExecStop=/opt/mc-gateway/bin/mc-gateway backend-stop --config /etc/mc-gateway/config.json --pid=${MAINPID}
+ExecStart=/opt/mc-gateway/bin/mc-gateway backend-start --config /etc/mc-gateway/.env
+ExecStop=/opt/mc-gateway/bin/mc-gateway backend-stop --config /etc/mc-gateway/.env --pid=${MAINPID}
 Restart=no
 TimeoutStopSec=infinity
 # If the helper fails, leave the process alive for operator recovery.

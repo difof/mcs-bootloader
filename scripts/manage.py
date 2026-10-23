@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Task entry points. Treat .env and command arguments as data, never shell code.
 
-Configuration and binary writes are atomic and deliberately do not restart the
-gateway. Restart is a separate, explicit operator action because it disconnects
-proxied clients even though Java remains running.
+The project .env is a symlink to the daemon's one private configuration file.
+Configuration reload and console commands go through the existing Unix socket.
+Binary deployment is atomic; gateway restart remains an explicit operation.
 """
 
 import argparse
-import contextlib
 import fcntl
 import hashlib
 import json
@@ -21,15 +20,11 @@ import sys
 import tempfile
 
 from env_config import (
-    MANAGE_DEFAULTS, read_env, render_config, serialize_env, values_from_config,
+    MANAGE_DEFAULTS, RUNTIME_DEFAULTS, read_env, redacted_values,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / ".env"
-FIXED_FIELDS = {
-    "backend_address", "rcon_address", "rcon_password_file", "backend_service",
-    "state_directory", "admin_socket",
-}
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.service\Z")
 ACCOUNT_NAME = re.compile(r"[a-z_][a-z0-9_-]*\$?\Z")
 
@@ -81,15 +76,18 @@ def sudo(argv, *, capture=False, user=None):
 
 
 def settings(values):
-    result = {**MANAGE_DEFAULTS}
+    result = {**MANAGE_DEFAULTS,
+              "MC_ADMIN_SOCKET": RUNTIME_DEFAULTS["MC_ADMIN_SOCKET"],
+              "MC_BACKEND_SERVICE": RUNTIME_DEFAULTS["MC_BACKEND_SERVICE"]}
     result.update({key: value for key, value in values.items() if key in result})
-    for name in ("MC_BINARY", "MC_CONFIG"):
-        require(Path(result[name]).is_absolute(), f"{name} must be an absolute path")
+    for name in ("MC_BINARY", "MC_CONFIG", "MC_ADMIN_SOCKET"):
+        require(Path(result[name]).is_absolute() and Path(result[name]) != Path("/"),
+                f"{name} must be an absolute non-root path")
     require(ACCOUNT_NAME.fullmatch(result["MC_SERVICE_USER"]),
             "MC_SERVICE_USER must be an existing non-root service account")
     require(result["MC_SERVICE_USER"] != "root", "MC_SERVICE_USER must not be root")
-    require(SERVICE_NAME.fullmatch(result["MC_GATEWAY_SERVICE"]),
-            "MC_GATEWAY_SERVICE must be a systemd service name")
+    for name in ("MC_GATEWAY_SERVICE", "MC_BACKEND_SERVICE"):
+        require(SERVICE_NAME.fullmatch(result[name]), f"{name} must be a systemd service name")
     require(re.fullmatch(r"[A-Za-z0-9_.-]+", result["MC_LOG_NAMESPACE"]),
             "MC_LOG_NAMESPACE contains unsupported characters")
     require(1 <= int(result["MC_LOG_LINES"]) <= 100000,
@@ -97,36 +95,11 @@ def settings(values):
     return result
 
 
-def installed_config(cfg):
-    raw = sudo(["cat", "--", cfg["MC_CONFIG"]], capture=True)
-    require(len(raw.encode()) <= 65536, "installed configuration exceeds 64 KiB")
-    value = json.loads(raw)
-    require(isinstance(value, dict), "installed configuration must be a JSON object")
-    return value, raw.encode()
-
-
-def candidate_config(values, current):
-    candidate = render_config(values, current)
-    changed = sorted(key for key in FIXED_FIELDS if candidate.get(key) != current.get(key))
-    require(not changed,
-            "these settings are tied to installed units, sudoers, or Minecraft listeners: " +
-            ", ".join(changed) +
-            "; configuration apply cannot migrate that installation")
-    return candidate
-
-
-@contextlib.contextmanager
-def temporary_config(candidate):
-    directory = ROOT / ".local"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix="config-check-", suffix=".json", dir=directory)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            json.dump(candidate, stream, indent=2)
-            stream.write("\n")
-        yield Path(name)
-    finally:
-        Path(name).unlink(missing_ok=True)
+def require_canonical_config(cfg):
+    """Fail clearly if an editor replaced the project symlink with a copy."""
+    require(ENV_FILE.resolve(strict=True) == Path(cfg["MC_CONFIG"]).resolve(strict=True),
+            "project .env is not the canonical MC_CONFIG file; move the duplicate aside "
+            "and restore the symlink with task config:init before applying settings")
 
 
 def atomic_write(path, data, *, mode, uid, gid):
@@ -148,7 +121,7 @@ def atomic_write(path, data, *, mode, uid, gid):
         Path(name).unlink(missing_ok=True)
 
 
-def replace_installed(source, destination, expected_hash, *, kind, binary=None, config=None):
+def replace_installed(source, destination, expected_hash, *, config):
     """Privileged final stage; verify again before touching the installed file."""
     require(os.geteuid() == 0, "installation requires sudo")
     require(source.is_absolute() and destination.is_absolute(), "installation paths must be absolute")
@@ -156,10 +129,10 @@ def replace_installed(source, destination, expected_hash, *, kind, binary=None, 
     descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        _replace_locked(source, destination, expected_hash, kind=kind, binary=binary, config=config)
+        _replace_locked(source, destination, expected_hash, config=config)
 
 
-def _replace_locked(source, destination, expected_hash, *, kind, binary, config):
+def _replace_locked(source, destination, expected_hash, *, config):
     info = destination.lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
             "installed destination must be a root-owned regular file without group/other writes")
@@ -167,35 +140,19 @@ def _replace_locked(source, destination, expected_hash, *, kind, binary, config)
     require(hashlib.sha256(old).hexdigest() == expected_hash,
             "installed file changed during validation; retry after reviewing the new file")
     data = source.read_bytes()
-    require(data, "candidate file is empty")
-    if kind == "config":
-        require(len(data) <= 65536, "candidate configuration exceeds 64 KiB")
-        before, after = json.loads(old), json.loads(data)
-        require(isinstance(after, dict), "candidate configuration must be a JSON object")
-        require(all(before.get(key) == after.get(key) for key in FIXED_FIELDS),
-                "candidate would change the installed backend topology")
-        require(binary and Path(binary).is_absolute(), "validation binary must be absolute")
-        # Validate the exact bytes that will be installed, not a mutable source.
-        descriptor, name = tempfile.mkstemp(prefix=".mc-gateway-check-", dir=destination.parent)
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
-            run([binary, "check", "--config", name], capture=True)
-        finally:
-            Path(name).unlink(missing_ok=True)
-        mode = 0o640
-    else:
-        require(kind == "binary" and data.startswith(b"\x7fELF"), "candidate is not an ELF executable")
-        require(config and Path(config).is_absolute(), "installed configuration path must be absolute")
-        descriptor, name = tempfile.mkstemp(prefix=".mc-gateway-check-", dir=destination.parent)
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                os.fchmod(stream.fileno(), 0o700)
-                stream.write(data)
-            run([name, "check", "--config", config], capture=True)
-        finally:
-            Path(name).unlink(missing_ok=True)
-        mode = 0o755
+    require(data.startswith(b"\x7fELF"), "candidate is not an ELF executable")
+    require(config and Path(config).is_absolute(), "installed configuration path must be absolute")
+    # Validate the exact executable bytes that will be installed, not a mutable
+    # build output. The credential is read from .env, never passed in argv.
+    descriptor, name = tempfile.mkstemp(prefix=".mc-gateway-check-", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o700)
+            stream.write(data)
+        run([name, "check", "--config", config], capture=True)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    mode = 0o755
     # A failed validation leaves both current and previous files unchanged.
     atomic_write(destination.with_name(destination.name + ".previous"), old,
                  mode=mode, uid=info.st_uid, gid=info.st_gid)
@@ -203,22 +160,32 @@ def _replace_locked(source, destination, expected_hash, *, kind, binary, config)
 
 
 def initialize():
-    require(not ENV_FILE.exists(), ".env already exists; use task config:edit")
-    cfg = settings({})
-    current, _ = installed_config(cfg)
-    values = values_from_config(current)
-    service_user = sudo(["systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
-                         "--property=User", "--value"], capture=True).strip()
-    require(service_user, "installed gateway service does not declare a User")
-    values["MC_SERVICE_USER"] = service_user
-    settings(values)
-    data = ("# Local operator and gateway settings. Never commit this file.\n"
-            "# task config:check; task config:apply; task gateway:restart\n" +
-            serialize_env(values))
-    descriptor = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as stream:
-        stream.write(data)
-    print("Created .env from the installed settings (mode 0600).")
+    canonical = Path(MANAGE_DEFAULTS["MC_CONFIG"])
+    require(canonical.is_file(), "canonical .env is missing; complete task install first")
+    if ENV_FILE.is_symlink() and ENV_FILE.resolve() == canonical.resolve():
+        print("Project .env already points to the canonical configuration.")
+        return
+    require(not os.path.lexists(ENV_FILE),
+            ".env already exists; refusing to overwrite it or create another configuration copy")
+    ENV_FILE.symlink_to(canonical)
+    print("Linked project .env to the canonical configuration; no settings were copied.")
+
+
+def preflight_gateway_restart(cfg):
+    """Keep the working daemon alive if the candidate cannot safely adopt Java."""
+    state = sudo(["systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
+                  "--property=ActiveState", "--value"], capture=True).strip()
+    command = [cfg["MC_BINARY"]]
+    if state in ("active", "activating", "reloading"):
+        command += ["restart-check", "--socket", cfg["MC_ADMIN_SOCKET"],
+                    "--config", cfg["MC_CONFIG"]]
+    else:
+        require(state in ("inactive", "failed"),
+                "gateway state is stopping or unknown; wait for it to settle before restarting")
+        # There is no running socket to consult. The daemon also verifies its
+        # credential before adopting a running Minecraft process at startup.
+        command += ["check", "--config", cfg["MC_CONFIG"]]
+    sudo(command, capture=True, user=cfg["MC_SERVICE_USER"])
 
 
 def operate(action, arguments):
@@ -231,33 +198,32 @@ def operate(action, arguments):
         require(ENV_FILE.exists(), "run task config:init first")
         editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano")
         require(editor, "EDITOR is empty")
-        os.execvp(editor[0], editor + [str(ENV_FILE)])
+        # Give editors the real filename: their atomic saves must replace the
+        # canonical file rather than silently replace the project symlink.
+        # Its parent has the service group and setgid bit, so replacement files
+        # retain compute access without opening the operator's home directory.
+        os.umask(0o027)
+        os.execvp(editor[0], editor + [str(ENV_FILE.resolve(strict=True))])
     require(ENV_FILE.exists(), "missing .env; run task config:init first")
     values = read_env(ENV_FILE)
     cfg = settings(values)
-    current, raw = installed_config(cfg)
+    require_canonical_config(cfg)
     command_prefix = [cfg["MC_BINARY"]]
 
-    if action in ("config-show", "config-check", "config-apply"):
+    if action in ("config-show", "config-check", "config-apply", "reload"):
         require(not arguments, "configuration tasks take no arguments")
-        candidate = candidate_config(values, current)
         if action == "config-show":
-            print(json.dumps(candidate, indent=2))
-            print("These are proposed settings; apply saves them for the next gateway start.")
+            print(json.dumps(redacted_values(values), indent=2, ensure_ascii=False))
+            print("These are .env settings with defaults; task config:apply reloads supported changes live.")
             return
-        with temporary_config(candidate) as path:
-            sudo(command_prefix + ["check", "--config", str(path)], capture=True)
-            if action == "config-check":
-                print(".env and RCON credential file permissions are valid. No files or services changed.")
-                return
-            if candidate == current:
-                print("Installed configuration already matches .env. No files or services changed.")
-                return
-            sudo([sys.executable, str(Path(__file__).resolve()), "_apply", str(path),
-                  cfg["MC_CONFIG"], hashlib.sha256(raw).hexdigest(), cfg["MC_BINARY"]])
-        print(f"Configuration saved atomically; previous copy is {cfg['MC_CONFIG']}.previous.")
-        print("The running gateway keeps its current settings until task gateway:restart.")
-        print("Gateway restart disconnects clients; Java stays running. No restart was performed.")
+        if action == "config-check":
+            sudo(command_prefix + ["check", "--config", cfg["MC_CONFIG"]],
+                 capture=True, user=cfg["MC_SERVICE_USER"])
+            print(".env is valid and readable by the service account. No files or services changed.")
+            return
+        sudo(command_prefix + ["reload", "--socket", cfg["MC_ADMIN_SOCKET"],
+                               "--config", cfg["MC_CONFIG"]], user=cfg["MC_SERVICE_USER"])
+        print("Configuration reload completed through the control socket. No service restart was requested.")
         return
 
     if action == "deploy":
@@ -276,22 +242,22 @@ def operate(action, arguments):
     if action.startswith("logs"):
         server = "server" in action
         follow = action.endswith("follow")
-        unit = current["backend_service"] if server else cfg["MC_GATEWAY_SERVICE"]
+        unit = cfg["MC_BACKEND_SERVICE"] if server else cfg["MC_GATEWAY_SERVICE"]
         argv = ["sudo", "-n", "--", "journalctl", "--namespace=" + cfg["MC_LOG_NAMESPACE"],
                 "-u", unit, "-n", str(cfg["MC_LOG_LINES"]), "-o", "cat"]
         argv += ["-f"] if follow else ["--no-pager"]
         os.execvp(argv[0], argv + arguments)
 
-    if action in ("status", "start", "stop", "command", "version"):
+    if action in ("status", "config-live", "start", "stop", "command", "version"):
         if action == "command":
-            argv = command_prefix + ["command", "--config", cfg["MC_CONFIG"],
+            argv = command_prefix + ["command", "--socket", cfg["MC_ADMIN_SOCKET"],
                                      "--timeout", str(cfg["MC_COMMAND_TIMEOUT"]), "--"] + arguments
         else:
             require(not arguments, f"{action} takes no arguments")
-            operation = {"start": "wake", "stop": "sleep"}.get(action, action)
+            operation = {"start": "wake", "stop": "sleep", "config-live": "config"}.get(action, action)
             argv = command_prefix + [operation]
             if operation != "version":
-                argv += ["--socket", current["admin_socket"]]
+                argv += ["--socket", cfg["MC_ADMIN_SOCKET"]]
         # Tasks run as the service user, not as root; RCON stays local/private.
         full = ["sudo", "-n", "-u", cfg["MC_SERVICE_USER"], "--"] + argv
         os.execvp(full[0], full)
@@ -299,6 +265,8 @@ def operate(action, arguments):
     if action in ("gateway-start", "gateway-stop", "gateway-restart"):
         require(not arguments, f"{action} takes no arguments")
         verb = action.removeprefix("gateway-")
+        if verb == "restart":
+            preflight_gateway_restart(cfg)
         if verb in ("stop", "restart"):
             print(f"Explicit gateway {verb}: connected clients disconnect; Java stays running.", flush=True)
         sudo(["systemctl", verb, cfg["MC_GATEWAY_SERVICE"]])
@@ -316,13 +284,10 @@ def main():
         arguments = arguments[1:]
     if args.action == "command" and arguments == ["--task-args"]:
         arguments = task_arguments()
-    if args.action in ("_apply", "_deploy"):
+    if args.action == "_deploy":
         require(len(arguments) == 4, "invalid install arguments")
         source, destination, digest = arguments[:3]
-        replace_installed(Path(source), Path(destination), digest,
-                          kind="config" if args.action == "_apply" else "binary",
-                          binary=arguments[3] if args.action == "_apply" else None,
-                          config=arguments[3] if args.action == "_deploy" else None)
+        replace_installed(Path(source), Path(destination), digest, config=arguments[3])
         return
     operate(args.action, arguments)
 

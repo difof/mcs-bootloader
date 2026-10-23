@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -12,10 +13,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 type Duration time.Duration
+
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
 
 func (d *Duration) UnmarshalJSON(raw []byte) error {
 	var text string
@@ -24,20 +28,26 @@ func (d *Duration) UnmarshalJSON(raw []byte) error {
 	}
 	value, err := time.ParseDuration(text)
 	if err != nil {
-		return err
+		return fmt.Errorf("duration must use valid Go duration syntax")
 	}
 	*d = Duration(value)
 	return nil
 }
 
 type Config struct {
-	Listen            string   `json:"listen"`
-	BackendAddress    string   `json:"backend_address"`
-	RCONAddress       string   `json:"rcon_address"`
-	RCONPasswordFile  string   `json:"rcon_password_file"`
+	Listen           string `json:"listen"`
+	BackendAddress   string `json:"backend_address"`
+	RCONAddress      string `json:"rcon_address"`
+	RCONPasswordFile string `json:"rcon_password_file"`
+	// RCONPassword lives only in the private .env, never a JSON response or log.
+	RCONPassword      string   `json:"-"`
 	Service           string   `json:"backend_service"`
 	StateDirectory    string   `json:"state_directory"`
 	AdminSocket       string   `json:"admin_socket"`
+	ServerDirectory   string   `json:"server_directory"`
+	JavaBinary        string   `json:"java_binary"`
+	JVMArgFile        string   `json:"jvm_argfile"`
+	ServerArgFile     string   `json:"server_argfile"`
 	Protocol          int      `json:"protocol"`
 	Version           string   `json:"version"`
 	MaxPlayers        int      `json:"max_players"`
@@ -62,6 +72,7 @@ func DefaultConfig() Config {
 		Listen: ":25565", BackendAddress: "127.0.0.1:25566", RCONAddress: "127.0.0.1:25575",
 		RCONPasswordFile: "/etc/mc-gateway/rcon.password", Service: "mc-gateway-backend.service",
 		StateDirectory: "/var/lib/mc-gateway", AdminSocket: "/run/mc-gateway/control.sock",
+		ServerDirectory: "/srv/minecraft", JavaBinary: "/usr/bin/java", JVMArgFile: "@user_jvm_args.txt",
 		Protocol: 767, Version: "1.21.1", MaxPlayers: 5, MaxConnections: 64,
 		IdleTimeout: Duration(time.Hour), PollInterval: Duration(15 * time.Second), OperationTimeout: Duration(5 * time.Second),
 		StartupTimeout: Duration(15 * time.Minute), ShutdownWarnAfter: Duration(3 * time.Minute), WakeCooldown: Duration(30 * time.Second),
@@ -74,11 +85,18 @@ func DefaultConfig() Config {
 
 func LoadConfig(path string) (Config, error) {
 	c := DefaultConfig()
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return c, err
 	}
 	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return c, fmt.Errorf("inspect configuration file: %w", err)
+	}
+	if !stat.Mode().IsRegular() {
+		return c, fmt.Errorf("configuration file must be a regular file")
+	}
 	raw, err := io.ReadAll(io.LimitReader(f, 65537))
 	if err != nil {
 		return c, err
@@ -86,10 +104,18 @@ func LoadConfig(path string) (Config, error) {
 	if len(raw) > 65536 {
 		return c, fmt.Errorf("configuration exceeds 64 KiB")
 	}
+	if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+		if stat.Mode().Perm() != 0600 && stat.Mode().Perm() != 0640 {
+			return c, fmt.Errorf(".env must have private 0600 or 0640 permissions")
+		}
+		return LoadEnv(raw)
+	}
+	// JSON is accepted only to migrate older installations. The file name is
+	// deliberately irrelevant: reload validates temporary .env snapshots.
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&c); err != nil {
-		return c, fmt.Errorf("configuration: %w", err)
+		return c, fmt.Errorf("configuration must be a JSON object with supported fields and value types")
 	}
 	if err := d.Decode(new(any)); err != io.EOF {
 		return c, fmt.Errorf("configuration has trailing data")
@@ -102,32 +128,45 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@:-]*\.service$
 func (c Config) Validate() error {
 	_, listenPort, err := net.SplitHostPort(c.Listen)
 	if err != nil {
-		return fmt.Errorf("listen address: %w", err)
+		return fmt.Errorf("listen address must contain a valid host and port")
 	}
 	if !validPort(listenPort) {
 		return fmt.Errorf("invalid listen port")
 	}
-	ports := map[string]bool{listenPort: true}
+	listenNumber, _ := strconv.Atoi(listenPort)
+	ports := map[int]bool{listenNumber: true}
 	for _, address := range []string{c.BackendAddress, c.RCONAddress} {
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
-			return fmt.Errorf("private address: %w", err)
+			return fmt.Errorf("backend and RCON addresses must contain a valid host and port")
 		}
 		ip, err := netip.ParseAddr(host)
 		if err != nil || !ip.IsLoopback() {
 			return fmt.Errorf("backend and RCON addresses must be numeric loopback addresses")
 		}
-		if !validPort(port) || ports[port] {
+		portNumber, _ := strconv.Atoi(port)
+		if !validPort(port) || ports[portNumber] {
 			return fmt.Errorf("listen, backend, and RCON need distinct valid ports")
 		}
-		ports[port] = true
+		ports[portNumber] = true
 	}
 	if !servicePattern.MatchString(c.Service) {
 		return fmt.Errorf("invalid backend service name")
 	}
-	for _, path := range []string{c.StateDirectory, c.AdminSocket, c.RCONPasswordFile} {
+	paths := []string{c.StateDirectory, c.AdminSocket, c.ServerDirectory, c.JavaBinary}
+	if c.RCONPassword != "" {
+		if err := validatePassword(c.RCONPassword); err != nil {
+			return err
+		}
+	} else {
+		paths = append(paths, c.RCONPasswordFile)
+	}
+	for _, path := range paths {
 		if !filepath.IsAbs(path) || filepath.Clean(path) == "/" {
 			return fmt.Errorf("runtime paths must be absolute and non-root")
+		}
+		if strings.ContainsAny(path, "\x00\r\n") {
+			return fmt.Errorf("runtime paths must not contain NUL or line breaks")
 		}
 	}
 	if c.Protocol != 767 {
@@ -155,7 +194,47 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func validPort(s string) bool { n, e := strconv.Atoi(s); return e == nil && n > 0 && n <= 65535 }
+func validPort(s string) bool {
+	n, e := strconv.Atoi(s)
+	return decimalDigits(s) && e == nil && n > 0 && n <= 65535
+}
+
+// Password preserves inline credentials exactly. ReadPassword is retained only
+// for older JSON configurations while an installation is being migrated.
+func (c Config) Password() (string, error) {
+	if c.RCONPassword != "" {
+		if err := validatePassword(c.RCONPassword); err != nil {
+			return "", err
+		}
+		return c.RCONPassword, nil
+	}
+	if c.RCONPasswordFile == "" {
+		return "", fmt.Errorf("MC_RCON_PASSWORD is required")
+	}
+	return ReadPassword(c.RCONPasswordFile)
+}
+
+func validatePassword(password string) error {
+	if len(password) < 16 || len(password) > 4096 || strings.ContainsAny(password, "\x00\r\n") {
+		return fmt.Errorf("RCON password must be 16-4096 bytes without line breaks or NUL")
+	}
+	return nil
+}
+
+// String and LogValue also guard against accidental logging with fmt or slog.
+// The alias keeps this conversion independent of these formatting methods.
+func (c Config) String() string {
+	type publicConfig Config
+	data, err := json.Marshal(publicConfig(c))
+	if err != nil {
+		return "<configuration unavailable>"
+	}
+	return string(data)
+}
+
+func (c Config) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
+func (c Config) GoString() string { return c.String() }
 
 func ReadPassword(path string) (string, error) {
 	f, err := os.Open(path)
