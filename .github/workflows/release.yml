@@ -65,12 +65,12 @@ jobs:
       - name: Validate once on Linux
         if: steps.guard.outputs.exists == 'false'
         run: |
-          test -z "$(gofmt -l cmd internal)"
+          test -z "$(gofmt -l assets*.go cmd internal)"
           go vet ./...
           go test -race -count=1 -timeout=90s ./...
           python3 -m unittest discover -s scripts -p 'test_*.py'
 
-      - name: Build both architectures and package installation files
+      - name: Build standalone binaries for both architectures
         if: steps.guard.outputs.exists == 'false'
         run: python3 scripts/release.py package --version "$RELEASE_TAG"
 
@@ -80,7 +80,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$RELEASE_TAG" \
-            "dist/$RELEASE_TAG/"*.tar.gz \
+            "dist/$RELEASE_TAG/mcs-bootloader_${RELEASE_TAG}_linux_amd64" \
+            "dist/$RELEASE_TAG/mcs-bootloader_${RELEASE_TAG}_linux_arm64" \
             "dist/$RELEASE_TAG/SHA256SUMS" \
             "dist/$RELEASE_TAG/build-info.json" \
             --verify-tag --fail-on-no-commits \
