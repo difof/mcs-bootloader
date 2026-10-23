@@ -34,30 +34,46 @@ tasks:
     desc: Build the daemon and local admin/command client
     cmds:
       - mkdir -p bin
-      - go build -trimpath -ldflags {{printf "-s -w -X main.version=%s" .VERSION | shellQuote}} -o bin/mc-gateway ./cmd/mc-gateway
+      - go build -trimpath -ldflags {{printf "-s -w -X main.version=%s" .VERSION | shellQuote}} -o bin/mcs-bootloader ./cmd/mcs-bootloader
   fuzz:handshake:
     desc: Fuzz handshake framing for 10 seconds
     cmds:
       - go test ./internal/mcproto -run '^$' -fuzz '^FuzzReadHandshake$' -fuzztime=10s -parallel=2
   install:
-    desc: First install only; verify stopped server and backup using private .env settings
+    desc: Check and build source, then install against a stopped and backed-up server
     cmds:
       - task: check
       - task: build
+      - task: install:binary
+  install:binary:
+    desc: Install the bundled binary; verify a stopped server and backup (no Go needed)
+    cmds:
       - mkdir -p .local
       - sudo -n python3 scripts/install.py --env .env
       - task: config:init
-  migrate:env:
-    desc: Migrate to one private .env; restart gateway once and leave Minecraft running
-    silent: true
+  backup:
+    desc: Create and verify a complete first-install backup while Minecraft is stopped
     cmds:
-      - python3 scripts/migrate_env.py {{.CLI_ARGS}}
+      - mkdir -p .local
+      - sudo -n python3 scripts/install.py --env .env --backup
   deploy:
     desc: Check, build, and install an update; leave running gateway and Java untouched
     cmds:
       - task: check
       - task: build
+      - task: deploy:binary
+  deploy:binary:
+    desc: Install a bundled update without rebuilding or restarting either service
+    cmds:
       - python3 scripts/manage.py deploy
+  release:package:
+    desc: 'Check and package both Linux architectures locally: task release:package VERSION=v0.3.0 (never tags or publishes)'
+    preconditions:
+      - sh: python3 scripts/release.py check-version --version {{.VERSION | shellQuote}}
+        msg: Supply a stable semantic version such as VERSION=v0.3.0
+    cmds:
+      - task: check
+      - python3 scripts/release.py package --version {{.VERSION | shellQuote}}
   status:
     desc: Show Minecraft state, player health, connections, and gateway version
     silent: true
@@ -105,6 +121,11 @@ tasks:
     silent: true
     cmds:
       - python3 scripts/manage.py logs-server-follow {{.CLI_ARGS}}
+  config:new:
+    desc: Create a private .env example with a random RCON password; never overwrite
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-new
   config:init:
     desc: Link project .env to the installed canonical file without copying secrets
     silent: true

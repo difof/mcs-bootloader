@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"mc-gateway/internal/mcproto"
-	"mc-gateway/internal/rcon"
+	"github.com/difof/mcs-bootloader/internal/mcproto"
+	"github.com/difof/mcs-bootloader/internal/rcon"
 )
 
 type Systemd struct {

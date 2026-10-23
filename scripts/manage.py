@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -103,7 +104,7 @@ def require_canonical_config(cfg):
 
 
 def atomic_write(path, data, *, mode, uid, gid):
-    descriptor, name = tempfile.mkstemp(prefix=".mc-gateway-", dir=path.parent)
+    descriptor, name = tempfile.mkstemp(prefix=".mcs-bootloader-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             os.fchmod(stream.fileno(), mode)
@@ -144,7 +145,7 @@ def _replace_locked(source, destination, expected_hash, *, config):
     require(config and Path(config).is_absolute(), "installed configuration path must be absolute")
     # Validate the exact executable bytes that will be installed, not a mutable
     # build output. The credential is read from .env, never passed in argv.
-    descriptor, name = tempfile.mkstemp(prefix=".mc-gateway-check-", dir=destination.parent)
+    descriptor, name = tempfile.mkstemp(prefix=".mcs-bootloader-check-", dir=destination.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             os.fchmod(stream.fileno(), 0o700)
@@ -171,6 +172,19 @@ def initialize():
     print("Linked project .env to the canonical configuration; no settings were copied.")
 
 
+def new_configuration():
+    """Create the first private .env without echoing or exporting credentials."""
+    require(not os.path.lexists(ENV_FILE), ".env already exists; use task config:edit")
+    example = (ROOT / ".env.example").read_text()
+    placeholder = "replace-with-a-random-private-password"
+    require(example.count(placeholder) == 1, ".env.example credential marker changed; review the example")
+    data = example.replace(placeholder, secrets.token_urlsafe(32))
+    descriptor = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(data)
+    print("Created private .env with a random RCON password. Run task config:edit to set your server paths and account.")
+
+
 def preflight_gateway_restart(cfg):
     """Keep the working daemon alive if the candidate cannot safely adopt Java."""
     state = sudo(["systemctl", "show", cfg["MC_GATEWAY_SERVICE"],
@@ -189,6 +203,10 @@ def preflight_gateway_restart(cfg):
 
 
 def operate(action, arguments):
+    if action == "config-new":
+        require(not arguments, "config:new takes no arguments")
+        new_configuration()
+        return
     if action == "config-init":
         require(not arguments, "config:init takes no arguments")
         initialize()
@@ -201,7 +219,7 @@ def operate(action, arguments):
         # Give editors the real filename: their atomic saves must replace the
         # canonical file rather than silently replace the project symlink.
         # Its parent has the service group and setgid bit, so replacement files
-        # retain compute access without opening the operator's home directory.
+        # retain service-account access without opening the operator's home directory.
         os.umask(0o027)
         os.execvp(editor[0], editor + [str(ENV_FILE.resolve(strict=True))])
     require(ENV_FILE.exists(), "missing .env; run task config:init first")
@@ -228,7 +246,7 @@ def operate(action, arguments):
 
     if action == "deploy":
         require(not arguments, "deploy takes no arguments")
-        source = ROOT / "bin/mc-gateway"
+        source = ROOT / "bin/mcs-bootloader"
         require(source.is_file(), "build the binary with task build first")
         sudo([str(source), "check", "--config", cfg["MC_CONFIG"]], capture=True)
         old_hash = sudo(["sha256sum", "--", cfg["MC_BINARY"]], capture=True).split()[0]
@@ -296,5 +314,5 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"mc-gateway tasks: {error}", file=sys.stderr)
+        print(f"mcs-bootloader tasks: {error}", file=sys.stderr)
         sys.exit(1)

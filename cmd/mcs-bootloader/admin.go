@@ -13,13 +13,18 @@ import (
 	"os"
 	"time"
 
-	"mc-gateway/internal/backend"
-	"mc-gateway/internal/control"
-	"mc-gateway/internal/gateway"
+	"github.com/difof/mcs-bootloader/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/control"
+	"github.com/difof/mcs-bootloader/internal/gateway"
 )
 
-const defaultConfigPath = "/etc/mc-gateway/.env"
+const defaultConfigPath = "/etc/mcs-bootloader/.env"
 const maxCommandTimeout = 5 * time.Minute
+
+// A valid 64 KiB .env can expand when JSON escapes argument/message text
+// (for example '<' becomes '\u003c'). Include that expansion and defaults
+// while keeping both configuration response readers explicitly bounded.
+const maxConfigResponseBytes = 512 * 1024
 
 type commandRequest struct {
 	Command string `json:"command"`
@@ -193,7 +198,7 @@ func socketRequest(ctx context.Context, socket, method, path string, body any, l
 
 func adminClient(command string, args []string) error {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
-	socket := flags.String("socket", "/run/mc-gateway/control.sock", "admin Unix socket")
+	socket := flags.String("socket", "/run/mcs-bootloader/control.sock", "admin Unix socket")
 	configPath := flags.String("config", defaultConfigPath, "configuration file to apply")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -215,7 +220,11 @@ func adminClient(command string, args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	data, err := socketRequest(ctx, *socket, method, command, body, 65536)
+	limit := int64(65536)
+	if command == "config" {
+		limit = maxConfigResponseBytes
+	}
+	data, err := socketRequest(ctx, *socket, method, command, body, limit)
 	if err != nil {
 		return err
 	}
@@ -232,7 +241,7 @@ func adminClient(command string, args []string) error {
 func appliedBackendConfig(socket string) (backend.Config, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	raw, err := socketRequest(ctx, socket, "GET", "backend", nil, 65536)
+	raw, err := socketRequest(ctx, socket, "GET", "backend", nil, maxConfigResponseBytes)
 	if err != nil {
 		return backend.Config{}, err
 	}

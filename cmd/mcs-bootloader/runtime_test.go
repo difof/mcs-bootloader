@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"mc-gateway/internal/backend"
-	"mc-gateway/internal/control"
-	"mc-gateway/internal/gateway"
-	"mc-gateway/internal/rcon"
+	"github.com/difof/mcs-bootloader/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/control"
+	"github.com/difof/mcs-bootloader/internal/gateway"
+	"github.com/difof/mcs-bootloader/internal/rcon"
 )
 
 const runtimeTestSecret = "runtime-private-test-password"
@@ -176,7 +176,7 @@ func newRuntimeFixture(t *testing.T, running bool) *runtimeFixture {
 	f.b = &runtimeTestBackend{running: running, players: 1, password: cfg.RCONPassword}
 	c := control.New(lifecycleConfig(cfg), f.b, logger)
 	s := gateway.New(trafficConfig(cfg), c, logger)
-	f.m = &runtimeConfig{cfg: cfg, path: f.m.path, digest: digest, generation: 1, controller: c, gateway: s, backend: f.b, level: level, log: logger}
+	f.m = &runtimeConfig{cfg: cfg.Clone(), path: f.m.path, digest: digest, generation: 1, controller: c, gateway: s, backend: f.b, level: level, log: logger}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { c.Run(ctx); close(done) }()
@@ -231,6 +231,25 @@ func runtimeEventually(t *testing.T, predicate func() bool) {
 	t.Fatal("runtime condition did not become true")
 }
 
+func TestRuntimeSnapshotsOwnLaunchArguments(t *testing.T) {
+	f := newRuntimeFixture(t, false)
+	first, metadata := f.m.snapshot()
+	want := append([]string(nil), first.LaunchArgs...)
+	first.LaunchArgs[0] = "changed-outside-runtime"
+	second, current := f.m.snapshot()
+	if !reflect.DeepEqual(second.LaunchArgs, want) || current != metadata {
+		t.Fatal("a caller changed the applied launch arguments through a snapshot")
+	}
+	if changed := restartFields(second, second.Clone()); len(changed) != 0 {
+		t.Fatal("equal independent argument arrays require an unnecessary restart")
+	}
+	changed := second.Clone()
+	changed.LaunchArgs[0] = "different-argument"
+	if fields := restartFields(second, changed); !reflect.DeepEqual(fields, []string{"MC_LAUNCH_ARGS"}) {
+		t.Fatal("changed launch arguments were not identified as restart-required")
+	}
+}
+
 func TestRuntimeReloadNoopAndCommittedGeneration(t *testing.T) {
 	f := newRuntimeFixture(t, true)
 	before, initial := f.m.snapshot()
@@ -256,7 +275,7 @@ func TestRuntimeReloadNoopAndCommittedGeneration(t *testing.T) {
 	if _, err := f.m.reload(context.Background(), initial.SHA256); err == nil {
 		t.Fatal("stale prepared digest was accepted")
 	}
-	if current, metadata := f.m.snapshot(); current != before || metadata != initial {
+	if current, metadata := f.m.snapshot(); !reflect.DeepEqual(current, before) || metadata != initial {
 		t.Fatal("stale digest rejection changed applied state")
 	}
 	result, err = f.m.reload(context.Background(), digest)
@@ -271,7 +290,7 @@ func TestRuntimeReloadNoopAndCommittedGeneration(t *testing.T) {
 		t.Fatalf("changed fields: got %v want %v", result.Changed, wantChanged)
 	}
 	current, metadata := f.m.snapshot()
-	if current != next || metadata != result.configMetadata || f.m.level.Level() != slog.LevelDebug {
+	if !reflect.DeepEqual(current, next) || metadata != result.configMetadata || f.m.level.Level() != slog.LevelDebug {
 		t.Fatal("runtime metadata/configuration/log level did not commit together")
 	}
 	traffic := f.m.gateway.ConfigSnapshot()
@@ -304,6 +323,8 @@ func TestRuntimeRejectedReloadPreservesEveryAppliedComponent(t *testing.T) {
 		{"unknown field", map[string]string{"MC_UNKNOWN": runtimeTestNextSecret, "MC_MAX_CONNECTIONS": "7"}, 0600},
 		{"restart backend", map[string]string{"MC_BACKEND_ADDRESS": "127.0.0.1:25567", "MC_MAX_CONNECTIONS": "7"}, 0600},
 		{"restart listen", map[string]string{"MC_LISTEN": ":25564", "MC_LOG_LEVEL": "debug"}, 0600},
+		{"restart executable", map[string]string{"MC_LAUNCH_EXECUTABLE": "./start.sh", "MC_LOG_LEVEL": "debug"}, 0600},
+		{"restart args", map[string]string{"MC_LAUNCH_ARGS": `["-Xmx2G","-jar","server.jar","nogui"]`, "MC_LOG_LEVEL": "debug"}, 0600},
 		{"password while running", map[string]string{"MC_RCON_PASSWORD": runtimeTestNextSecret, "MC_MAX_CONNECTIONS": "7"}, 0600},
 		{"public permissions", map[string]string{"MC_MAX_CONNECTIONS": "7"}, 0644},
 	}
@@ -324,7 +345,7 @@ func TestRuntimeRejectedReloadPreservesEveryAppliedComponent(t *testing.T) {
 				t.Fatal("rejected update exposed a credential")
 			}
 			after, afterMetadata := f.m.snapshot()
-			if before != after || metadata != afterMetadata || !reflect.DeepEqual(traffic, f.m.gateway.ConfigSnapshot()) || f.m.level.Level() != slog.LevelInfo {
+			if !reflect.DeepEqual(before, after) || metadata != afterMetadata || !reflect.DeepEqual(traffic, f.m.gateway.ConfigSnapshot()) || f.m.level.Level() != slog.LevelInfo {
 				t.Fatal("rejected update partially mutated applied configuration")
 			}
 			f.b.mu.Lock()
@@ -348,7 +369,7 @@ func TestRuntimePasswordRotationRequiresKnownStoppedBackend(t *testing.T) {
 		t.Fatalf("uncertain backend state allowed password rotation: %v", err)
 	}
 	after, afterMetadata := f.m.snapshot()
-	if before != after || metadata != afterMetadata {
+	if !reflect.DeepEqual(before, after) || metadata != afterMetadata {
 		t.Fatal("failed rotation changed applied credentials")
 	}
 	f.b.mu.Lock()
@@ -552,6 +573,60 @@ func TestRuntimePrivateSocketExposesRedactedAppliedConfig(t *testing.T) {
 	}
 }
 
+func TestConfigurationSocketAllowsJSONExpansionWithinItsBound(t *testing.T) {
+	f := newRuntimeFixture(t, false)
+	// This valid literal is only 32 KiB in .env, but nearly 192 KiB once
+	// encoding/json escapes HTML characters in the socket response.
+	argument := strings.Repeat("<", 32768)
+	raw, err := os.ReadFile(f.m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, []byte("MC_LAUNCH_ARGS='[\""+argument+"\"]'\n")...)
+	if err := os.WriteFile(f.m.path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, digest, err := readConfigSnapshot(f.m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.m.mu.Lock()
+	f.m.cfg, f.m.digest = cfg.Clone(), digest
+	f.m.mu.Unlock()
+	encoded, err := json.Marshal(backendEnvelope{Config: cfg, Password: cfg.RCONPassword})
+	if err != nil || len(encoded) <= 65536 || len(encoded) > maxConfigResponseBytes {
+		t.Fatal("fixture does not reproduce bounded JSON response expansion")
+	}
+	startRuntimeSocket(t, f)
+	applied, err := appliedBackendConfig(f.socket)
+	if err != nil || !reflect.DeepEqual(applied.LaunchArgs, []string{argument}) || applied.RCONPassword != cfg.RCONPassword {
+		t.Fatalf("backend helper could not read valid expanded configuration: %v", err)
+	}
+	// Exercise the human-facing CLI reader as well, using a file so a large
+	// response cannot fill a pipe buffer and block the test.
+	output, err := os.CreateTemp(t.TempDir(), "config-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	stdout := os.Stdout
+	os.Stdout = output
+	defer func() { os.Stdout = stdout }()
+	if err := adminClient("config", []string{"--socket", f.socket}); err != nil {
+		t.Fatalf("config CLI could not read valid expanded configuration: %v", err)
+	}
+	body, err := os.ReadFile(output.Name())
+	if err != nil || bytes.Contains(body, []byte(runtimeTestSecret)) {
+		t.Fatal("expanded CLI output exposed the password or was unreadable")
+	}
+	var response struct {
+		Effective backend.Config `json:"effective"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || !reflect.DeepEqual(response.Effective.LaunchArgs, []string{argument}) {
+		t.Fatal("expanded CLI output changed launch arguments")
+	}
+}
+
 func TestRuntimePrivateSocketRejectsMalformedRequestsBeforeEffects(t *testing.T) {
 	f := newRuntimeFixture(t, false)
 	startRuntimeSocket(t, f)
@@ -709,7 +784,7 @@ func TestRestartCheckCannotBypassPasswordRotation(t *testing.T) {
 				t.Fatalf("restart bypassed password apply: %v", err)
 			}
 			after, current := f.m.snapshot()
-			if before != after || metadata != current {
+			if !reflect.DeepEqual(before, after) || metadata != current {
 				t.Fatal("restart preflight mutated runtime")
 			}
 			f.write(t, map[string]string{"MC_RCON_PASSWORD": runtimeTestSecret, "MC_LISTEN": ":25564"})

@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import json
 import shutil
 import subprocess
@@ -12,7 +13,7 @@ class InstallerValidationTests(unittest.TestCase):
     def env_file(self, directory, additions="", password="  private $() `literal` #= café 🚀  "):
         path = Path(directory) / ".env"
         text = ("# preserve my comments\nMC_RCON_PASSWORD=" + json.dumps(password, ensure_ascii=False)
-                + "\nMC_SERVER_ARGFILE=@libraries/loader/unix_args.txt\n" + additions)
+                + '\nMC_LAUNCH_ARGS=\'["@user_jvm_args.txt","@libraries/loader/unix_args.txt","nogui"]\'\n' + additions)
         path.write_text(text)
         path.chmod(0o600)
         return path
@@ -55,14 +56,14 @@ class InstallerValidationTests(unittest.TestCase):
 
     def test_installation_settings_use_one_private_env_and_preserve_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = self.env_file(temporary, "MC_SERVICE_USER=compute\nMC_SERVER_DIRECTORY=/home/compute/minecraft/server\n")
+            path = self.env_file(temporary, "MC_SERVICE_USER=gamesvc\nMC_SERVER_DIRECTORY=/srv/test-minecraft\n")
             original = path.read_bytes()
             settings, raw, metadata = install.installation_settings(path)
             self.assertEqual(raw, original)
             self.assertEqual(settings["MC_RCON_PASSWORD"], "  private $() `literal` #= café 🚀  ")
-            self.assertEqual(settings["MC_SERVICE_USER"], "compute")
-            self.assertEqual(settings["MC_CONFIG"], "/etc/mc-gateway/.env")
-            self.assertEqual(settings["MC_JVM_ARGFILE"], "@user_jvm_args.txt")
+            self.assertEqual(settings["MC_SERVICE_USER"], "gamesvc")
+            self.assertEqual(settings["MC_CONFIG"], "/etc/mcs-bootloader/.env")
+            self.assertEqual(settings["MC_LAUNCH_EXECUTABLE"], "/usr/bin/java")
             self.assertEqual(metadata.st_uid, path.stat().st_uid)
             self.assertNotIn("MC_RCON_PASSWORD_FILE", settings)
 
@@ -73,7 +74,7 @@ class InstallerValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "private"):
                 install.installation_settings(path)
             path.chmod(0o600)
-            path.write_text("MC_SERVER_ARGFILE=@libraries/loader/unix_args.txt\n")
+            path.write_text("MC_LAUNCH_ARGS='[]'\n")
             with self.assertRaisesRegex(RuntimeError, "MC_RCON_PASSWORD"):
                 install.installation_settings(path)
             for password in ("short", "x" * 4097, "replace-with-a-random-private-password"):
@@ -109,7 +110,7 @@ class InstallerValidationTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), raw)
             self.assertEqual(canonical.read_bytes(), raw)
             self.assertEqual(source.stat().st_mode & 0o777, 0o600)
-            self.assertFalse(list(base.glob(".mc-gateway-*")))
+            self.assertFalse(list(base.glob(".mcs-bootloader-*")))
 
     def test_installation_env_link_refuses_concurrent_operator_edits(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -122,39 +123,66 @@ class InstallerValidationTests(unittest.TestCase):
             self.assertFalse(source.is_symlink())
             self.assertEqual(source.read_bytes(), changed)
 
-    def test_existing_argfiles_are_required_inside_the_server(self):
+    def test_generic_executable_may_be_absolute_or_relative_and_contain_spaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = Path(temporary)
+            executable = server / "custom launcher"
+            executable.write_text("#!/bin/sh\nexec true\n")
+            executable.chmod(0o755)
+            self.assertEqual(install.launch_executable(server, "./custom launcher"), executable)
+            self.assertEqual(install.launch_executable(server, str(executable)), executable)
+            executable.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "executable"):
+                install.launch_executable(server, "./custom launcher")
+
+    def test_configurable_ports_update_only_network_properties(self):
+        settings = {**install.RUNTIME_DEFAULTS, "MC_LISTEN": ":28000",
+                    "MC_BACKEND_ADDRESS": "127.0.0.2:28001", "MC_RCON_ADDRESS": "127.0.0.2:28002"}
+        self.assertEqual(install.network_settings(settings), (("", 28000), ("127.0.0.2", 28001), ("127.0.0.2", 28002)))
+        result = install.updated_properties(b"level-name=custom-world\nonline-mode=true\n", "private",
+                                            settings["MC_BACKEND_ADDRESS"], settings["MC_RCON_ADDRESS"])
+        self.assertIn(b"server-ip=127.0.0.2\n", result)
+        self.assertIn(b"server-port=28001\n", result)
+        self.assertIn(b"rcon.port=28002\n", result)
+        self.assertIn(b"level-name=custom-world\nonline-mode=true\n", result)
+        for invalid in ({"MC_RCON_ADDRESS": "0.0.0.0:28002"}, {"MC_RCON_ADDRESS": "127.0.0.1:28002"},
+                        {"MC_RCON_ADDRESS": "127.0.0.2:28001"}, {"MC_BACKEND_ADDRESS": "localhost:28001"}):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                install.network_settings({**settings, **invalid})
+
+    @unittest.skipUnless(shutil.which("tar") and shutil.which("zstd"), "requires tar and zstd")
+    def test_full_server_backup_verifies_custom_world_and_detects_damage(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
-            server = base / "server"
+            server, backup = base / "server", base / "backup"
             server.mkdir()
-            (server / "args.txt").write_text("unchanged loader arguments\n")
-            self.assertEqual(install.server_argument_file(server, "@args.txt", "MC_SERVER_ARGFILE"), server / "args.txt")
-            (base / "outside.txt").write_text("not server arguments\n")
-            (server / "escape.txt").symlink_to(base / "outside.txt")
-            for argument in ("args.txt", "@@args.txt", "@../outside.txt", "@/absolute", "@escape.txt"):
-                with self.subTest(argument=argument), self.assertRaises(RuntimeError):
-                    install.server_argument_file(server, argument, "MC_SERVER_ARGFILE")
+            backup.mkdir()
+            original = b"level-name=custom world\nonline-mode=true\n"
+            (server / "server.properties").write_bytes(original)
+            world = server / "custom world"
+            world.mkdir()
+            (world / "level.dat").write_bytes(b"test-only synthetic world data")
+            (server / "mods").mkdir()
+            (server / "mods" / "example.jar").write_bytes(b"synthetic mod bytes")
+            archive = backup / "server-before-bootloader.tar.zst"
+            subprocess.run([shutil.which("tar"), "--zstd", "--create", "--file", str(archive),
+                            "--directory", str(server), "."], check=True, capture_output=True)
+            (backup / "server.properties").write_bytes(original)
+            manifest = {"format": 1, "server_directory": str(server),
+                        "archive_sha256": install.sha256_file(archive),
+                        "properties_sha256": hashlib.sha256(original).hexdigest()}
+            (backup / "backup.json").write_text(json.dumps(manifest))
+            self.assertEqual(install.verify_backup(backup, server, original), archive)
+            with self.assertRaisesRegex(RuntimeError, "different server"):
+                install.verify_backup(backup, base / "different", original)
+            with self.assertRaisesRegex(RuntimeError, "properties differ"):
+                install.verify_backup(backup, server, original + b"changed=true\n")
+            archive.write_bytes(archive.read_bytes()[:-1] + b"broken")
+            with self.assertRaisesRegex(RuntimeError, "checksum"):
+                install.verify_backup(backup, server, original)
+            self.assertEqual((world / "level.dat").read_bytes(), b"test-only synthetic world data")
 
-    def test_systemd_working_directory_is_unquoted_with_literal_specifiers(self):
-        self.assertEqual(install.systemd_working_directory("/srv/example/minecraft/server"),
-                         "/srv/example/minecraft/server")
-        self.assertEqual(install.systemd_working_directory("/srv/minecraft/100%"),
-                         "/srv/minecraft/100%%")
-        for invalid in ("relative/world", '"/srv/world"', "/srv/a b", "/srv/a\\b",
-                        "/srv/a'b", "/srv/world\nExecStart=/evil", "/srv/a\x7f"):
-            with self.subTest(path=invalid), self.assertRaises(RuntimeError):
-                install.systemd_working_directory(invalid)
 
-    @unittest.skipUnless(shutil.which("systemd-analyze"), "requires systemd's actual unit parser")
-    def test_rendered_working_directory_passes_systemd_unit_verification(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            unit = Path(temporary) / "mc-gateway-working-directory-test.service"
-            for path in ("/srv/example/minecraft/server", "/srv/minecraft/100%"):
-                unit.write_text("[Service]\nType=oneshot\nExecStart=/usr/bin/true\nWorkingDirectory="
-                                + install.systemd_working_directory(path) + "\n")
-                result = subprocess.run([shutil.which("systemd-analyze"), "verify", str(unit)],
-                                        capture_output=True, text=True, timeout=20)
-                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

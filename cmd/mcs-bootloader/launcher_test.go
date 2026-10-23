@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"mc-gateway/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/backend"
 )
 
 // The child invokes the actual CLI main and must be replaced by the fake Java
@@ -63,15 +63,14 @@ func TestBackendStartExecUsesAppliedSocketAndPreservesServerFiles(t *testing.T) 
 		t.Fatal(err)
 	}
 	cfg := backend.DefaultConfig()
-	cfg.ServerDirectory, cfg.JavaBinary, cfg.AdminSocket = serverDirectory, java, socket
+	cfg.ServerDirectory, cfg.LaunchExecutable, cfg.AdminSocket = serverDirectory, filepath.Join("..", "fake-java"), socket
 	cfg.RCONPassword, cfg.RCONPasswordFile = runtimeTestNextSecret, ""
-	cfg.JVMArgFile = "@user args $(touch must-not-exist).txt"
-	cfg.ServerArgFile = "@libraries/loader/args ; literal.txt"
+	cfg.LaunchArgs = []string{"@user args $(touch must-not-exist).txt", "@libraries/loader/args ; literal.txt", "nogui", "", "${HOME}", "literal \u0027 quotes \" and 🚀"}
 	beforeProperties := []byte("# retain these exact bytes\r\nonline-mode=false\r\nlevel-name=world\r\nrcon.password=" + runtimeTestSecret + "\r\nmotd=Original server\r\n")
 	files := map[string][]byte{
 		"server.properties":     beforeProperties,
-		cfg.JVMArgFile[1:]:      []byte("-Xms1G\n-Xmx2G\n"),
-		cfg.ServerArgFile[1:]:   []byte("existing.loader.Main\n--existing-argument\n"),
+		cfg.LaunchArgs[0][1:]:   []byte("-Xms1G\n-Xmx2G\n"),
+		cfg.LaunchArgs[1][1:]:   []byte("existing.loader.Main\n--existing-argument\n"),
 		"world/level.dat":       {0x0a, 0x00, 0xff, 0x12, 0x00, 0x34},
 		"mods/valuable-mod.jar": []byte("disposable unchanged mod sentinel\x00"),
 	}
@@ -156,9 +155,10 @@ func TestBackendStartExecUsesAppliedSocketAndPreservesServerFiles(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRecord := []string{serverDirectory, java, cfg.JVMArgFile, cfg.ServerArgFile, "nogui", strconv.Itoa(child.Process.Pid), ""}
+	wantRecord := append([]string{serverDirectory, java}, cfg.LaunchArgs...)
+	wantRecord = append(wantRecord, strconv.Itoa(child.Process.Pid), "")
 	if !reflect.DeepEqual(strings.Split(string(recorded), "\x00"), wantRecord) {
-		t.Fatal("exec changed the process ID, working directory, or literal Java arguments")
+		t.Fatal("exec changed the process ID, working directory, or literal launch arguments")
 	}
 	files["server.properties"] = bytes.Replace(beforeProperties, []byte("rcon.password="+runtimeTestSecret), []byte("rcon.password="+runtimeTestNextSecret), 1)
 	checked := 0

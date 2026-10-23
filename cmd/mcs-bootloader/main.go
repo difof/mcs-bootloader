@@ -1,4 +1,4 @@
-// mc-gateway is a Minecraft TCP gateway with conservative server lifecycle control.
+// mcs-bootloader is a Minecraft TCP gateway with conservative server lifecycle control.
 package main
 
 import (
@@ -7,14 +7,14 @@ import (
 	"os"
 	"strconv"
 
-	"mc-gateway/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/backend"
 )
 
 var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "mc-gateway:", err)
+		fmt.Fprintln(os.Stderr, "mcs-bootloader:", err)
 		os.Exit(1)
 	}
 }
@@ -37,7 +37,7 @@ func run(args []string) error {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	configPath := flags.String("config", defaultConfigPath, "configuration file")
 	pidText := flags.String("pid", "", "backend main PID (backend-stop only)")
-	socket := flags.String("socket", "/run/mc-gateway/control.sock", "applied backend configuration socket")
+	socket := flags.String("socket", "/run/mcs-bootloader/control.sock", "applied backend configuration socket")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func run(args []string) error {
 			}
 		}
 		if command == "backend-start" {
-			return backend.StartJava(cfg)
+			return backend.StartServer(cfg)
 		}
 		return gracefulBackendStop(cfg, pid)
 	}

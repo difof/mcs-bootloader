@@ -1,289 +1,111 @@
-# mc-gateway
+# mcs-bootloader
 
-A small Go gateway that keeps a modded Minecraft server visible while its JVM is stopped. A real login attempt wakes the server; an hour of verified emptiness stops it gracefully through local RCON. Minecraft 1.21.1 / protocol 767 is the supported version for this release.
+Keep a heavy Minecraft server asleep when nobody is playing. A small Go gateway stays online, wakes Minecraft on a login attempt, and gracefully stops it after an hour with no players.
 
-## Player experience
+**Supported:** Linux with systemd, Minecraft Java **1.21.1 / protocol 767**, including modded servers. This is a TCP gateway: once Minecraft is ready, the original handshake and all game/mod traffic pass through unchanged.
 
-- Server-list refreshes show sleeping/starting/ready status and never wake the JVM.
-- Joining a sleeping server starts it once and displays a reconnect message.
-- Long modpack startups require reconnecting; this gateway does not emulate a lobby or promise an indefinite login hold.
-- Once ready, original handshake/login bytes and all subsequent traffic pass through unchanged. Mod-specific status fields are retained in a persistent cache.
+- Server-list refreshes show status without starting Minecraft.
+- Joining while asleep starts the server once and shows a **“server booting, please reconnect”** message. Reconnect when it is ready; there is no simulated lobby or indefinite loading screen.
+- Shutdown uses loopback RCON `stop`. Unknown player counts and active joins prevent sleep. The backend has no restart loop and is never force-killed.
+- Logs cover state changes and useful errors; routine polling and status pings are quiet.
 
-## Safety model
+## Requirements
 
-The gateway and game run under separate systemd units. Restarting the gateway does not stop the game. The backend has no restart loop. RCON and the game backend must bind to loopback; only the gateway is public. A root-owned sudo rule permits the gateway user to start exactly the named backend service, with no shell or arbitrary commands.
+- An existing, working Minecraft server and the Java/runtime required by its modpack.
+- Linux with systemd and journald namespace support, Python **3.10+**, [Task 3](https://taskfile.dev/docs/installation), `sudo`, GNU `tar`, `zstd`, and standard system tools (`runuser`, `sha256sum`).
+- A non-root account that owns the Minecraft files, plus an operator account with sudo access. Tasks use noninteractive sudo; run `sudo -v` first if your setup requires a password.
+- For **source builds only**: [Go 1.24+](https://go.dev/dl/), Git, and a C compiler for the race tests. Release packages include the compiled binary.
 
-Failed player queries are unknown, never zero. A final RCON check and an atomic join reservation protect shutdown against joining players. After `stop`, the gateway waits for the service to exit. Slow or uncertain shutdown never escalates to process signals. Startup failures do not launch a second JVM while the existing service is running. Ordinary active TCP game connections also inhibit sleep.
+The installer manages one instance using `/opt/mcs-bootloader`, `/etc/mcs-bootloader`, and two systemd units. Minecraft can live anywhere the chosen service account can access.
 
-The backend unit's manual stop helper waits for RCON and then for the original PID to exit. Its infinite stop timeout, harmless fallback signal, and disabled SIGKILL deliberately favor preserving the world over completing an unhealthy service stop. A stuck shutdown requires operator investigation.
+## Install
 
-## Operator tasks
+**Stop Minecraft and its old launcher/restart loop first.** Keep them stopped until installation finishes. The installer verifies a full backup before changing any Minecraft settings.
 
-Run `task` in the project directory to see all commands. The project is owned by
-the development account; both systemd services run as the existing Minecraft
-account. Task uses `sudo -u` to run the local socket client as that account.
-Java does not run as root. The daemon's sole sudo permission is to start exactly
-the backend unit. Graceful automatic and guarded manual shutdown use loopback
-RCON. Systemd runs a small startup helper that obtains the daemon's applied
-configuration through the private socket and then executes Java with the
-existing JVM/loader arguments. There is no modpack restart loop.
-
-| Task | Behavior |
-|---|---|
-| `task status` | Gateway version, Minecraft state, players, connections, health, counters, and applied configuration generation |
-| `task start` | Start Minecraft once; also available as `task wake` |
-| `task stop` | Save and stop only when confirmed empty; also available as `task sleep` |
-| `task command -- op PlayerName` | Run a Minecraft console command and print its reply |
-| `task command -- list` | Ask Minecraft for its current players |
-| `task logs:server` | Recent Minecraft console output |
-| `task logs:server:follow` | Follow Minecraft console output; Ctrl+C only closes the viewer |
-| `task logs` / `task logs:follow` | Recent/followed gateway events |
-| `task config:edit` | Edit the canonical `.env` using `$VISUAL`, `$EDITOR`, or nano |
-| `task config:show` | Show the desired file settings and defaults, with the password redacted |
-| `task config:live` | Show the daemon's applied settings and generation, with the password redacted |
-| `task config:check` | Validate `.env` and check that the service account can read it |
-| `task config:apply` / `task reload` | Apply supported changes through the socket, without restarting either service |
-| `task gateway:restart` | Load new code or startup-only settings; disconnects clients, leaves Java running |
-| `task gateway:stop` / `task gateway:start` | Stop/start the gateway itself; does not directly stop/start Java |
-| `task version` | Installed executable version; the running daemon's version is in `task status` |
-
-Minecraft console output is in its systemd journal. Use one terminal for
-`task logs:server:follow` and another for `task command -- ...`. No RCON client
-installation or password entry is needed. Console commands travel over the
-private Unix socket; the daemon supplies its applied RCON credentials.
-
-Commands accept normal CLI arguments. For JSON/NBT or shell metacharacters,
-single-quote the whole command or the individual JSON argument:
+From source:
 
 ```sh
-task command -- op PlayerName
-task command -- 'tellraw @a {"text":"Hello everyone"}'
-task command -- tellraw @a '{"text":"Hello everyone"}'
-task command -- /list
-task logs:server -- --since '20 minutes ago'
+git clone https://github.com/difof/mcs-bootloader.git
+cd mcs-bootloader
+task config:new
+task config:edit
+# Set the account, server root, launch command and backup destination below.
+task backup
+task install
 ```
 
-Arguments are passed literally and joined with spaces; no second shell parses
-the command. An optional leading `/` is accepted. Empty commands and line breaks
-are rejected. The daemon serializes the request with its authenticated loopback
-RCON connection and returns the reply. It does not automatically wake Minecraft
-or retry a command whose reply was lost. A failed response can mean the command
-already executed; inspect state before repeating a command with side effects.
+For a prebuilt install, download the appropriate `linux_amd64` or `linux_arm64` archive and `SHA256SUMS` from [Releases](https://github.com/difof/mcs-bootloader/releases), verify the archive with `sha256sum --check --ignore-missing SHA256SUMS`, and extract it. Inside its directory, run the same configuration and backup tasks, then **`task install:binary`**. Release downloads appear after the first intentional release tag.
 
-The command task reads the invoking Task process's original arguments through
-Linux `/proc`, avoiding Task 3.44's recursive substitution inside its CLI argument
-variables. This preserves literal `{{...}}` text when Task starts the command.
-Task can still reject some template expressions during its own initialization;
-such an error prevents the command from reaching Minecraft.
+`task backup` saves the **whole server**, including mods and custom world directory names, to the new/empty `MC_BACKUP_DIRECTORY`. It verifies the compressed archive and checksum; it never overwrites an existing backup. The automatic backup does not support symlinks pointing outside the server root.
 
-`task stop` refuses occupied servers, pending/active joins, and unknown player
-counts. It is a safe sleep request, not a maintenance lock: a later login wakes
-the server again. If you intentionally need the console's ordinary stop command
-while players are online, `task command -- stop` saves and shuts down Minecraft,
-disconnecting those players. Since this bypasses the lifecycle's sleep API, the
-gateway may briefly report an unexpected exit and enforce its wake cooldown.
-It still does not restart Java in a loop or send kill signals.
+Installation changes only the network/RCON properties required for the gateway. It preserves worlds, mods, authentication and whitelist settings. It starts the gateway; Minecraft remains asleep until a login attempt or `task start`. Forward/expose only the public gateway port (default **25565**).
 
-`task gateway:stop` closes public access and suspends wake/idle monitoring. Java,
-if running, remains running. Start the gateway again to restore access and
-monitoring. Keep the old restart wrapper stopped while these services manage
-Minecraft.
+## Configure `.env`
 
-## Configuration through .env
-
-The project `.env` is a symlink to **`/etc/mc-gateway/.env`**. That single file
-holds the gateway, Java startup, operator settings, and actual
-`MC_RCON_PASSWORD`. There is no active JSON configuration, separate RCON
-password file, or `backend.env`. `.env` is ignored by Git; `.env.example`
-documents every supported setting.
-
-The canonical file belongs to the operator, with the Minecraft service group
-and mode **0640**. Its directory has the same ownership and mode **2750**. The owner can edit it and the
-service account can read it; unrelated users cannot traverse that directory.
-The directory's setgid bit keeps the service group on replacement files.
-`task config:edit` resolves the project symlink before starting the editor and
-sets umask `0027`, so ordinary atomic editor saves keep the one-file layout.
-The private development home directory does not need to become accessible to
-the service account.
-
-`task config:init` restores the project symlink to an existing canonical file.
-It refuses to overwrite a local copy or a different link. If an external editor
-has replaced the symlink with a separate `.env`, tasks reject that split rather
-than applying a hidden second configuration; move the duplicate aside and run
-`task config:init` after reviewing its edits.
+`task config:new` creates a mode-0600 file with a random RCON password. Set these to match your existing server:
 
 ```dotenv
+MC_SERVICE_USER=minecraft
+MC_SERVER_DIRECTORY=/srv/minecraft
+MC_LAUNCH_EXECUTABLE=/usr/bin/java
+MC_LAUNCH_ARGS='["-Xms2G","-Xmx6G","-jar","server.jar","nogui"]'
+MC_BACKUP_DIRECTORY=/srv/minecraft-backups/pre-bootloader
 MC_IDLE_TIMEOUT=1h
-MC_POLL_INTERVAL=15s
-MC_LOG_LEVEL=info
-MC_COMMAND_TIMEOUT=30s
-MC_LOG_LINES=100
-MC_BOOT_MESSAGE="Server is booting up.\nPlease reconnect in a few minutes."
 ```
 
-Use the following workflow:
+For Forge/NeoForge, use the **actual argument files from your installed pack**:
+
+```dotenv
+MC_LAUNCH_EXECUTABLE=/usr/bin/java
+MC_LAUNCH_ARGS='["@user_jvm_args.txt","@libraries/net/neoforged/neoforge/YOUR_VERSION/unix_args.txt","nogui"]'
+```
+
+For a custom script:
+
+```dotenv
+MC_LAUNCH_EXECUTABLE=/bin/bash
+MC_LAUNCH_ARGS='["./start-once.sh","--your-option","value with spaces"]'
+```
+
+The working directory is `MC_SERVER_DIRECTORY`. An executable may also be a relative path such as `./start-once.sh`. Arguments are a **JSON array of literal strings**: no shell expansion, interpolation or command substitution. Launchers must stay in the foreground, preferably `exec` the game process, and must not contain their own restart loop.
+
+After installation, project `.env` links to **`/etc/mcs-bootloader/.env`**. All operator settings and the RCON password live there; Minecraft's required native password is synchronized on its next cold start. The file is private to the operator and service account. See [.env.example](.env.example) for every setting.
 
 ```sh
 task config:edit
 task config:check
-task config:apply       # task reload is the same operation
-task config:live
+task config:apply
 ```
 
-Editing saves the desired configuration on disk. `config:check` checks syntax,
-runtime constraints, the credential, and access as the service account; it does
-not apply anything or decide whether a particular change is safe to load live.
-`config:apply` sends a fingerprint of that file to the running daemon through
-`/run/mc-gateway/control.sock`. The daemon reads its own canonical file,
-validates the complete candidate, and serializes the change with wake/sleep.
-It rejects a stale fingerprint, an invalid configuration, or a prohibited live
-change before changing its applied state. Correct the file and apply again.
+Timers, messages, connection limits and log level apply through the private Unix socket without a restart. Launch executable/arguments require `task gateway:restart` and take effect on Minecraft's next start. Password changes require Minecraft to be stopped before applying. Network addresses and service paths are installation settings; changing them needs a coordinated migration.
 
-**A successful live reload preserves the listener and existing game connections
-without restarting Java.** The daemon reports its configuration generation and
-changed field names, and emits one useful configuration event rather than a
-settings dump. `task config:show` describes the file; `task config:live` describes the
-running daemon. Both redact the password. `task status` includes the applied
-generation and file fingerprint, so an unapplied edit cannot masquerade as a
-running change. Generation starts fresh when the daemon restarts.
+## Daily tasks
 
-| Settings | When changes take effect |
+Run `task` to list everything. Commands run from the project/release directory.
+
+| Command | What it does |
 |---|---|
-| Idle timeout, poll interval, operation/startup timeouts, shutdown warning, wake cooldown | Live after `task config:apply`; shortening idle timeout can allow sleep on the next verified-empty poll |
-| Messages/MOTDs and log level | Live after apply; subsequent responses and log events use the new settings |
-| `MC_VERSION`, `MC_MAX_PLAYERS` | Live fallback status metadata; cached real-server metadata and Minecraft's native player limit remain authoritative |
-| Connection limit, handshake timeout, backend dial timeout | Apply affects new connections; existing opaque relays stay open even if the new limit is lower |
-| `MC_RCON_PASSWORD` | Apply only while Minecraft is confirmed stopped; see password rotation below |
-| Listen/backend/RCON addresses, protocol, backend service, state directory, socket | Live apply rejects these; require a gateway restart and any matching listener, unit, permissions, or tunnel migration |
-| `MC_SERVER_DIRECTORY`, `MC_JAVA_BINARY`, `MC_JVM_ARGFILE`, `MC_SERVER_ARGFILE` | Live apply rejects these; load with an explicit gateway restart, then Java uses them on its next start |
-| Task-only settings such as `MC_LOG_LINES` and `MC_COMMAND_TIMEOUT` | Next task invocation reads them directly from `.env` |
+| `task status` | State, players, connections, health and running version |
+| `task start` / `task stop` | Wake, or save/stop only when confirmed empty; later logins can wake it again |
+| `task command -- op PlayerName` | Send any console command through the private socket/RCON |
+| `task command -- 'tellraw @a {"text":"Hello!"}'` | Pass JSON or special characters literally |
+| `task logs:server` / `task logs:server:follow` | Read/follow Minecraft console output |
+| `task logs` / `task logs:follow` | Read/follow gateway events |
+| `task config:show` / `task config:live` | Desired/applied settings, password redacted |
+| `task config:edit` / `task config:check` / `task config:apply` | Edit, validate and live-reload `.env` |
+| `task gateway:stop` / `task gateway:start` | Disable/restore public access and wake monitoring; Minecraft stays running |
+| `task gateway:restart` | Load new gateway code/startup settings; disconnects clients, leaves Minecraft running |
+| `task deploy` / `task deploy:binary` | Validate/install a source build or packaged binary, then restart explicitly |
+| `task config:init` | Restore the project symlink to an existing installation's `.env` |
 
-The backend startup helper obtains the **applied** startup settings and password
-from the daemon's private socket. Editing `.env` without applying or explicitly
-restarting the gateway therefore cannot silently change the next Java launch.
-Gateway restart disconnects proxied clients and adopts any already-running
-Minecraft process; it does not restart Java or change that process's arguments.
-Before stopping a running gateway, `task gateway:restart` asks it to validate
-the candidate configuration. The preflight rejects **any** password difference
-from the applied credential, even when Minecraft is stopped, and leaves the
-old gateway running. Apply a password change through `task config:apply` while
-Minecraft is stopped before requesting a restart. Gateway restart therefore
-cannot bypass the password rotation guard.
+For a console-like setup, follow `task logs:server:follow` in one terminal and run `task command -- ...` in another. There is no tmux stdin to attach to. RCON commands are never automatically retried: if a reply is lost, check state before repeating a command with side effects.
 
-Omitted runtime fields use compiled defaults, not values from an older file.
-Keep the installation's host-specific paths and service settings in `.env`.
-`MC_MAX_PLAYERS` controls fallback status display; Minecraft's actual player
-limit remains in its existing `server.properties`.
+Both services run as `MC_SERVICE_USER`, never root. Operator tasks use `sudo -u` to access that user's mode-0600 socket. The daemon's sudo rule allows exactly **starting its backend unit**; it cannot run arbitrary root commands. RCON and the backend bind only to loopback.
 
-### Password rotation
+## Updates and releases
 
-Stop Minecraft gracefully, wait until `task status` confirms `asleep`, then
-change `MC_RCON_PASSWORD` with `task config:edit`, check, and apply. The daemon
-refuses a password change while Minecraft is running or its state is uncertain.
-It retains the previous applied credential when rejecting the change. A login
-can still wake a sleeping server, so an attempted rotation that races a wake
-is rejected safely and must be retried while stopped.
+For source updates: `git pull`, `task deploy`, then `task gateway:restart`. For a release archive, extract it separately, run `task config:init`, `task deploy:binary`, then `task gateway:restart`. Neither deployment command restarts Minecraft.
 
-Minecraft itself requires `rcon.password` in its native `server.properties`.
-The backend helper synchronizes that one property from the applied `.env`
-credential before the next Java start, preserving unrelated settings. This is
-Minecraft's required input, not another operator-maintained gateway config.
-Changing `.env` alone does not rewrite a running server's properties or attempt
-to change its in-memory password. Historical rollback archives may retain old
-configuration and credentials; they are never active runtime inputs.
+`task check` runs formatting, vet, Go race tests and Python tests. `task release:package VERSION=v0.2.1` builds local packages; it does **not** tag or publish.
 
-The `.env` parser treats values as data. It supports `KEY=value`, comments,
-optional `export`, single-quoted literal strings, and JSON-style double-quoted
-strings. JSON `\n` escapes work in player messages. It rejects unknown/duplicate
-keys, multiline assignments, and invalid values. It does not expand `$variables`
-or execute `$(commands)`. Do not source this file in a shell.
-
-## Development
-
-Requires Go 1.24+, a C compiler for the race detector, and Task.
-
-| Task | Purpose |
-|---|---|
-| `task fmt` | Format source |
-| `task check` | Formatting, vet, Go race tests, and Python operator/install tests |
-| `task build` | Build `bin/mc-gateway` |
-| `task install VERSION=0.2.0` | First install from `.env`: validate backup, install, activate, and link the canonical file |
-| `task migrate:env` | One-time migration from the earlier JSON/password-file installation; restarts the gateway once |
-| `task deploy VERSION=0.2.0` | Check, build, and atomically install an update without restarting processes |
-| `task fuzz:handshake` | Bounded protocol-parser fuzz run |
-
-No external Go modules are required. Host-specific settings, credentials, caches, and binaries belong outside Git. The deployment templates use a generic `minecraft` account and server path; an installation must adapt those values to its existing server.
-
-## Deployment
-
-The first-install helper reads `.env` using `scripts/install.py --env .env`.
-Copy `.env.example` into a private `.env` and set the existing service account,
-server directory, Java binary, JVM and loader argument files, backup directory,
-and a strong private RCON password. Argument-file values include their leading
-`@` and remain relative to the server directory. Use the modpack's actual
-existing files rather than guessing a loader version.
-
-The backup directory must contain the original `server.properties` and a tested
-`world-before-gateway.tar.zst` containing `world/level.dat`. The installer refuses
-an existing installation or a running Java/restart launcher. Run
-`task install VERSION=0.2.0`; it validates the units and configuration before
-activation, installs the canonical `.env`, and links the project file to it.
-It records installation evidence in ignored `.local/installation.json`, and
-restores pre-activation changes if validation fails. That report is an audit
-record, not a second configuration source.
-
-For an existing installation, run `task check` and `task build VERSION=0.2.0`,
-then `task migrate:env` once. The self-elevating migration consolidates the prior
-configuration and password into the canonical file, installs the new binary and
-unit helpers, validates everything, and **automatically restarts only the
-gateway once**. That restart disconnects proxied clients. The helper verifies
-the new daemon's status and that the Minecraft PID is unchanged; it does not
-restart Minecraft or edit world/mod data. No additional gateway restart is
-needed after a successful migration.
-
-Obsolete inputs are retired into a root-owned mode-0600 historical archive at
-`.local/env-migration-TIMESTAMP.tar.gz`, with a separate redacted report. The
-archive is rollback evidence and is never read for active configuration.
-Routine binary updates use `task deploy VERSION=...`, which validates and
-atomically installs the exact tested executable, retains
-`mc-gateway.previous`, and leaves both services running. Activate the new
-executable with `task gateway:restart` when ready.
-
-1. Confirm the server is stopped and preserve a consistent world backup and original configuration.
-2. Build and test. Install the binary under `/opt/mc-gateway/bin` owned by root.
-3. Adapt the two unit templates to the existing game account. Put startup settings and the credential in the one canonical `.env`; keep the existing JVM arguments and Java runtime. Backend startup obtains an applied snapshot through the socket and executes Java directly.
-4. For the first installation, set `server-ip=127.0.0.1`, `server-port=25566`, `enable-rcon=true`, `rcon.port=25575`, and the applied password in `server.properties`. Set `broadcast-rcon-to-ops=false` so health checks do not notify players. Protect that native properties file against unrelated users. Verify the actual RCON listener is loopback before exposing the gateway.
-5. Add a sudoers rule for exactly `/usr/bin/systemctl start mc-gateway-backend.service` for the gateway account. Validate it with `visudo -cf`. Do not add arbitrary systemctl arguments or a shell.
-6. Install the dedicated journald namespace settings. Verify units and configuration before enabling only `mc-gateway.service`. The backend must remain disabled at boot.
-7. Exercise status-only requests, a waking login, readiness, genuine modded play, graceful shutdown, and a second wake. Keep the initial world backup until the real-client test passes.
-
-## Logs and operations
-
-Gateway INFO logs cover state transitions, actual player-count changes, proxied connection open/close with duration and byte counts, and health recovery. Normal status pings and healthy polls are silent. Error deduplication and warning throttles prevent retries from flooding the log; aggregate counters remain available through `task status`.
-
-Health checks reuse one authenticated loopback RCON connection, avoiding Minecraft's per-connection log chatter. A broken or uncertain exchange discards that connection and fails the check; a later poll reconnects. Commands with uncertain delivery are never automatically replayed.
-
-The dedicated `mc-gateway` journald namespace has a 64 MiB persistent budget, 8 MiB file rotation, a 16 MiB runtime budget, and a 14-day retention limit. Gateway and backend events can be inspected separately by unit. The game's existing own log files retain their existing behavior.
-
-The admin API is a mode-0600 Unix socket owned by the service account. It supports
-status, redacted applied configuration, validated reload, wake, guarded sleep,
-and operator console commands. A separate internal endpoint supplies the applied
-startup snapshot to the backend helper; that response includes the credential
-and is restricted by the same private socket permissions. There is no public
-HTTP admin listener. `task sleep` refuses occupied or unhealthy servers; it is
-not a force-stop command.
-
-Use the operator tasks above to run the installed server. Keep the original restart wrapper for rollback; running it alongside the gateway would create an unmanaged Java process outside the lifecycle controller.
-
-## Compatibility boundaries
-
-- The initial envelope is validated for the tested Minecraft version; encrypted/compressed/gameplay/mod packets remain opaque.
-- Backend source addresses become loopback. Existing IP bans or per-IP limits will see the proxy address. No unsupported PROXY headers are injected.
-- Mods using separate UDP/TCP ports need their own routing review.
-- Existing authentication, whitelist, mods, JVM tuning, and world content are not changed by the gateway.
-- Fake players reported by RCON may deliberately keep the server awake; unknown responses always inhibit sleep.
-- Configured timeouts report stalled boot/save operations; they never kill Java.
-
-## Rollback
-
-When empty, use `task sleep` and wait for `asleep`. Stop and disable only the gateway service, confirm Java is gone, restore the preserved `server.properties` and its original permissions, and start Minecraft using its original launcher. Do not restore an older world merely to remove the gateway; that would discard subsequent gameplay. Keep host-specific backup locations and the precise installation record in ignored `.local/` files.
+GitHub releases run only for intentionally pushed SemVer tags such as `v0.2.1`. One bounded Linux job tests once, cross-compiles amd64/arm64, and publishes archives, checksums, build information and release notes/changelog. Ordinary branch pushes and pull requests spend **no Actions minutes** in this repository. Do not create a release tag for routine edits; [AGENTS.md](AGENTS.md) records the explicit owner-approval policy.

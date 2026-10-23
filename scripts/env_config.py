@@ -28,9 +28,8 @@ CONFIG_KEYS = {
     "MC_STATE_DIRECTORY": "state_directory",
     "MC_ADMIN_SOCKET": "admin_socket",
     "MC_SERVER_DIRECTORY": "server_directory",
-    "MC_JAVA_BINARY": "java_binary",
-    "MC_JVM_ARGFILE": "jvm_argfile",
-    "MC_SERVER_ARGFILE": "server_argfile",
+    "MC_LAUNCH_EXECUTABLE": "launch_executable",
+    "MC_LAUNCH_ARGS": "launch_args",
     "MC_PROTOCOL": "protocol",
     "MC_VERSION": "version",
     "MC_MAX_PLAYERS": "max_players",
@@ -56,12 +55,12 @@ RUNTIME_DEFAULTS = {
     "MC_LISTEN": ":25565",
     "MC_BACKEND_ADDRESS": "127.0.0.1:25566",
     "MC_RCON_ADDRESS": "127.0.0.1:25575",
-    "MC_BACKEND_SERVICE": "mc-gateway-backend.service",
-    "MC_STATE_DIRECTORY": "/var/lib/mc-gateway",
-    "MC_ADMIN_SOCKET": "/run/mc-gateway/control.sock",
+    "MC_BACKEND_SERVICE": "mcs-bootloader-backend.service",
+    "MC_STATE_DIRECTORY": "/var/lib/mcs-bootloader",
+    "MC_ADMIN_SOCKET": "/run/mcs-bootloader/control.sock",
     "MC_SERVER_DIRECTORY": "/srv/minecraft",
-    "MC_JAVA_BINARY": "/usr/bin/java",
-    "MC_JVM_ARGFILE": "@user_jvm_args.txt",
+    "MC_LAUNCH_EXECUTABLE": "/usr/bin/java",
+    "MC_LAUNCH_ARGS": '["-jar","server.jar","nogui"]',
     "MC_PROTOCOL": 767,
     "MC_VERSION": "1.21.1",
     "MC_MAX_PLAYERS": 5,
@@ -82,14 +81,14 @@ RUNTIME_DEFAULTS = {
 }
 
 MANAGE_DEFAULTS = {
-    "MC_BINARY": "/opt/mc-gateway/bin/mc-gateway",
-    "MC_CONFIG": "/etc/mc-gateway/.env",
+    "MC_BINARY": "/opt/mcs-bootloader/bin/mcs-bootloader",
+    "MC_CONFIG": "/etc/mcs-bootloader/.env",
     "MC_SERVICE_USER": "minecraft",
-    "MC_GATEWAY_SERVICE": "mc-gateway.service",
-    "MC_LOG_NAMESPACE": "mc-gateway",
+    "MC_GATEWAY_SERVICE": "mcs-bootloader.service",
+    "MC_LOG_NAMESPACE": "mcs-bootloader",
     "MC_LOG_LINES": 100,
     "MC_COMMAND_TIMEOUT": "30s",
-    "MC_BACKUP_DIRECTORY": "/srv/minecraft-backups/pre-gateway",
+    "MC_BACKUP_DIRECTORY": "/srv/minecraft-backups/pre-bootloader",
 }
 
 INTEGER_KEYS = frozenset({
@@ -154,7 +153,33 @@ def _validate_value(key, value, line=None):
         value.encode("utf-8")
     except UnicodeEncodeError:
         _error("must contain valid Unicode", key, line)
+    if key == "MC_LAUNCH_EXECUTABLE" and len(value.encode("utf-8")) > 4096:
+        _error("must be at most 4096 UTF-8 bytes", key, line)
+    if key == "MC_LAUNCH_ARGS":
+        launch_arguments(value, line=line)
     return value
+
+
+def launch_arguments(value, *, line=None):
+    """Decode a literal JSON argv array; never split or interpret shell syntax."""
+    key = "MC_LAUNCH_ARGS"
+    try:
+        arguments = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        _error("must be a JSON array of strings", key, line)
+    if not isinstance(arguments, list) or len(arguments) > 256:
+        _error("must be a JSON array containing at most 256 strings", key, line)
+    size = 0
+    for argument in arguments:
+        if not isinstance(argument, str) or any(c in argument for c in "\x00\r\n"):
+            _error("arguments must be strings without NUL or line breaks", key, line)
+        try:
+            size += len(argument.encode("utf-8"))
+        except UnicodeEncodeError:
+            _error("arguments must contain valid Unicode", key, line)
+    if size > 32768:
+        _error("arguments must total at most 32768 UTF-8 bytes", key, line)
+    return arguments
 
 
 def validate_values(values):
@@ -241,7 +266,7 @@ def render_config(values, base_dict):
     result = dict(base_dict)
     for key, value in validate_values(values).items():
         if key in CONFIG_KEYS:
-            result[CONFIG_KEYS[key]] = value
+            result[CONFIG_KEYS[key]] = launch_arguments(value) if key == "MC_LAUNCH_ARGS" else value
     return result
 
 
@@ -257,7 +282,8 @@ def values_from_config(base_dict, *, include_manage_defaults=True):
     if any(field not in reverse for field in base_dict):
         _error("base configuration contains an unsupported field")
     values = dict(MANAGE_DEFAULTS) if include_manage_defaults else {}
-    values.update({reverse[field]: value for field, value in base_dict.items()})
+    values.update({reverse[field]: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                   if field == "launch_args" else value for field, value in base_dict.items()})
     return validate_values(values)
 
 

@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"mc-gateway/internal/backend"
-	"mc-gateway/internal/control"
-	"mc-gateway/internal/gateway"
+	"github.com/difof/mcs-bootloader/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/control"
+	"github.com/difof/mcs-bootloader/internal/gateway"
 )
 
 // runtimeConfig keeps the applied configuration separate from edits on disk.
@@ -131,7 +131,7 @@ func parseLogLevel(value string) slog.Level {
 func (m *runtimeConfig) snapshot() (backend.Config, configMetadata) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cfg, configMetadata{Generation: m.generation, SHA256: m.digest}
+	return m.cfg.Clone(), configMetadata{Generation: m.generation, SHA256: m.digest}
 }
 
 func restartFields(old, next backend.Config) []string {
@@ -143,12 +143,12 @@ func restartFields(old, next backend.Config) []string {
 		{"MC_RCON_ADDRESS", old.RCONAddress, next.RCONAddress}, {"MC_BACKEND_SERVICE", old.Service, next.Service},
 		{"MC_STATE_DIRECTORY", old.StateDirectory, next.StateDirectory}, {"MC_ADMIN_SOCKET", old.AdminSocket, next.AdminSocket},
 		{"MC_PROTOCOL", old.Protocol, next.Protocol}, {"MC_SERVER_DIRECTORY", old.ServerDirectory, next.ServerDirectory},
-		{"MC_JAVA_BINARY", old.JavaBinary, next.JavaBinary}, {"MC_JVM_ARGFILE", old.JVMArgFile, next.JVMArgFile},
-		{"MC_SERVER_ARGFILE", old.ServerArgFile, next.ServerArgFile},
+		{"MC_LAUNCH_EXECUTABLE", old.LaunchExecutable, next.LaunchExecutable},
+		{"MC_LAUNCH_ARGS", old.LaunchArgs, next.LaunchArgs},
 	}
 	var changed []string
 	for _, f := range fields {
-		if f.old != f.next {
+		if !reflect.DeepEqual(f.old, f.next) {
 			changed = append(changed, f.name)
 		}
 	}
@@ -224,7 +224,7 @@ func (m *runtimeConfig) reload(ctx context.Context, expected string) (reloadResu
 		m.backend.ReconfigureRCON(next.RCONPassword, time.Duration(next.OperationTimeout), passwordChanged)
 		m.level.Set(parseLogLevel(next.LogLevel))
 		m.mu.Lock()
-		m.cfg = next
+		m.cfg = next.Clone()
 		m.digest = digest
 		m.generation++
 		metadata = configMetadata{Generation: m.generation, SHA256: m.digest}

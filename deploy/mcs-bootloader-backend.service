@@ -7,9 +7,9 @@ Type=exec
 User=minecraft
 Group=minecraft
 WorkingDirectory=/
-# Use the existing JVM arguments and installed loader. No restart shell loop.
-ExecStart=/opt/mc-gateway/bin/mc-gateway backend-start --config /etc/mc-gateway/.env
-ExecStop=/opt/mc-gateway/bin/mc-gateway backend-stop --config /etc/mc-gateway/.env --pid=${MAINPID}
+# Launch the configured executable and literal argv in the server directory.
+ExecStart=/opt/mcs-bootloader/bin/mcs-bootloader backend-start --config /etc/mcs-bootloader/.env
+ExecStop=/opt/mcs-bootloader/bin/mcs-bootloader backend-stop --config /etc/mcs-bootloader/.env --pid=${MAINPID}
 Restart=no
 TimeoutStopSec=infinity
 # If the helper fails, leave the process alive for operator recovery.
@@ -17,7 +17,7 @@ KillSignal=SIGCONT
 SendSIGKILL=no
 KillMode=control-group
 UMask=0027
-LogNamespace=mc-gateway
+LogNamespace=mcs-bootloader
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=5000
 # Intentionally no Install section: waking is explicit, not automatic at boot.

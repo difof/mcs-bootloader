@@ -14,10 +14,10 @@ import (
 	"unicode/utf8"
 )
 
-// StartJava replaces the backend helper with Java. It creates no shell or
-// restart loop; the separately managed backend unit remains Java's owner.
-func StartJava(cfg Config) error {
-	launch, err := prepareJava(cfg)
+// StartServer replaces the backend helper with the configured executable.
+// Arguments are literal: no shell, expansion, or restart loop is added.
+func StartServer(cfg Config) error {
+	launch, err := prepareLaunch(cfg)
 	if err != nil {
 		return err
 	}
@@ -29,15 +29,15 @@ func StartJava(cfg Config) error {
 		return fmt.Errorf("cannot enter MC_SERVER_DIRECTORY")
 	}
 	// Retain exclusive bindings until every preflight and properties update is
-	// complete. Java must acquire these same ports after exec.
+	// complete. The server must acquire these same ports after exec.
 	launch.releasePorts()
 	if err := syscall.Exec(launch.binary, launch.args, os.Environ()); err != nil {
-		return fmt.Errorf("cannot execute MC_JAVA_BINARY")
+		return fmt.Errorf("cannot execute MC_LAUNCH_EXECUTABLE")
 	}
 	return nil
 }
 
-type javaLaunch struct {
+type serverLaunch struct {
 	directory  string
 	binary     string
 	args       []string
@@ -46,17 +46,17 @@ type javaLaunch struct {
 	ports      []net.Listener
 }
 
-func (p *javaLaunch) releasePorts() {
+func (p *serverLaunch) releasePorts() {
 	for _, listener := range p.ports {
 		_ = listener.Close()
 	}
 	p.ports = nil
 }
 
-// prepareJava performs all checks without changing server.properties or the
+// prepareLaunch performs all checks without changing server.properties or the
 // process working directory. Holding the returned listeners protects the
 // narrow credential synchronization step against an already-running backend.
-func prepareJava(cfg Config) (*javaLaunch, error) {
+func prepareLaunch(cfg Config) (*serverLaunch, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -71,19 +71,17 @@ func prepareJava(cfg Config) (*javaLaunch, error) {
 	if err != nil || !stat.IsDir() {
 		return nil, fmt.Errorf("MC_SERVER_DIRECTORY must be an existing directory")
 	}
-	stat, err = os.Stat(cfg.JavaBinary)
+	binary := cfg.LaunchExecutable
+	if !filepath.IsAbs(binary) {
+		binary = filepath.Join(cfg.ServerDirectory, binary)
+	}
+	stat, err = os.Stat(binary)
 	if err != nil || !stat.Mode().IsRegular() || stat.Mode().Perm()&0111 == 0 {
-		return nil, fmt.Errorf("MC_JAVA_BINARY must be a regular executable file")
+		return nil, fmt.Errorf("MC_LAUNCH_EXECUTABLE must be a regular executable file")
 	}
-	if err := validateJavaArgFile(cfg.ServerDirectory, cfg.JVMArgFile, "MC_JVM_ARGFILE"); err != nil {
-		return nil, err
-	}
-	if err := validateJavaArgFile(cfg.ServerDirectory, cfg.ServerArgFile, "MC_SERVER_ARGFILE"); err != nil {
-		return nil, err
-	}
-	launch := &javaLaunch{
-		directory: cfg.ServerDirectory, binary: cfg.JavaBinary,
-		args:       []string{cfg.JavaBinary, cfg.JVMArgFile, cfg.ServerArgFile, "nogui"},
+	launch := &serverLaunch{
+		directory: cfg.ServerDirectory, binary: binary,
+		args:       append([]string{binary}, cfg.LaunchArgs...),
 		properties: filepath.Join(cfg.ServerDirectory, "server.properties"), password: password,
 	}
 	for _, port := range []struct{ name, address string }{
@@ -92,31 +90,11 @@ func prepareJava(cfg Config) (*javaLaunch, error) {
 		listener, err := net.Listen("tcp", port.address)
 		if err != nil {
 			launch.releasePorts()
-			return nil, fmt.Errorf("%s port is occupied or unavailable; refusing to change server.properties or start Java", port.name)
+			return nil, fmt.Errorf("%s port is occupied or unavailable; refusing to change server.properties or start the server", port.name)
 		}
 		launch.ports = append(launch.ports, listener)
 	}
 	return launch, nil
-}
-
-func validateJavaArgFile(directory, argument, name string) error {
-	if len(argument) < 2 || argument[0] != '@' || argument[1] == '@' || strings.ContainsAny(argument, "\x00\r\n") {
-		return fmt.Errorf("%s must be a single @argument-file reference", name)
-	}
-	path := argument[1:]
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(directory, path)
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return fmt.Errorf("%s must reference a readable regular file", name)
-	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil || !stat.Mode().IsRegular() {
-		return fmt.Errorf("%s must reference a readable regular file", name)
-	}
-	return nil
 }
 
 const maxPropertiesBytes = 1024 * 1024
@@ -152,7 +130,7 @@ func syncServerPassword(path, password string) (bool, error) {
 		return false, err
 	}
 	directory := filepath.Dir(path)
-	tmp, err := os.CreateTemp(directory, ".mc-gateway-properties-*")
+	tmp, err := os.CreateTemp(directory, ".mcs-bootloader-properties-*")
 	if err != nil {
 		return false, fmt.Errorf("cannot create a private server.properties replacement")
 	}

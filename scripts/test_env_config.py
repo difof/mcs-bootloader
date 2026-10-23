@@ -89,7 +89,7 @@ class EnvConfigTests(unittest.TestCase):
         self.assertEqual({key: values[key] for key in env_config.MANAGE_DEFAULTS},
                          env_config.MANAGE_DEFAULTS)
 
-        self.assertEqual(values["MC_CONFIG"], "/etc/mc-gateway/.env")
+        self.assertEqual(values["MC_CONFIG"], "/etc/mcs-bootloader/.env")
         self.assertNotIn("MC_RCON_PASSWORD_FILE", values)
 
     def test_config_mapping_preserves_base_values_and_excludes_task_options(self):
@@ -106,7 +106,9 @@ class EnvConfigTests(unittest.TestCase):
 
     def test_seed_from_runtime_fields_is_lossless(self):
         original = {"max_players": 19, "boot_message": "One\nTwo $HOME",
-                    "rcon_password": "synthetic-private-password"}
+                    "rcon_password": "synthetic-private-password",
+                    "launch_executable": "./custom launcher",
+                    "launch_args": ["--name", "value with spaces", "", "$(never execute)"]}
         values = env_config.values_from_config(original)
         self.assertEqual(env_config.render_config(self.read(env_config.serialize_env(values)), {}), original)
         self.assertEqual({key: values[key] for key in env_config.MANAGE_DEFAULTS},
@@ -121,11 +123,23 @@ class EnvConfigTests(unittest.TestCase):
         displayed = env_config.redacted_values(values)
         self.assertEqual(displayed["MC_RCON_PASSWORD"], "[REDACTED]")
         self.assertEqual(displayed["MC_IDLE_TIMEOUT"], "2h")
-        self.assertEqual(displayed["MC_ADMIN_SOCKET"], "/run/mc-gateway/control.sock")
-        self.assertEqual(displayed["MC_CONFIG"], "/etc/mc-gateway/.env")
+        self.assertEqual(displayed["MC_ADMIN_SOCKET"], "/run/mcs-bootloader/control.sock")
+        self.assertEqual(displayed["MC_CONFIG"], "/etc/mcs-bootloader/.env")
         self.assertNotIn(secret, json.dumps(displayed))
         self.assertEqual(values["MC_RCON_PASSWORD"], secret)
-        self.assertNotIn("MC_SERVER_ARGFILE", env_config.redacted_values({}))
+        self.assertEqual(env_config.redacted_values({})["MC_LAUNCH_ARGS"], '["-jar","server.jar","nogui"]')
+
+    def test_launch_arguments_are_literal_typed_bounded_json_arrays(self):
+        arguments = ["@loader/args.txt", "two words", "", "$(literal)", "{{.UNCHANGED}}"]
+        raw = json.dumps(arguments)
+        self.assertEqual(env_config.launch_arguments(raw), arguments)
+        self.assertEqual(env_config.render_config({"MC_LAUNCH_ARGS": raw}, {}), {"launch_args": arguments})
+        self.assertEqual(env_config.launch_arguments("[]"), [])
+        for invalid in ("null", "{}", '[null]', '[1]', '[true]', '"-jar server.jar"',
+                        '["line\\nfeed"]', '["nul\\u0000"]', '["\\ud800"]',
+                        json.dumps([""] * 257), json.dumps(["é" * 16385])):
+            with self.subTest(invalid=invalid[:50]), self.assertRaises(env_config.EnvConfigError):
+                env_config.validate_values({"MC_LAUNCH_ARGS": invalid})
 
     def test_duplicate_unknown_and_syntax_errors_never_echo_values(self):
         secret = "DO_NOT_ECHO_THIS_VALUE"

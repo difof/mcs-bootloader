@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"mc-gateway/internal/backend"
-	"mc-gateway/internal/rcon"
+	"github.com/difof/mcs-bootloader/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/rcon"
 )
 
 // runCommand submits one command through the private socket (or direct local

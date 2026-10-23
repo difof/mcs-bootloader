@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"mc-gateway/internal/control"
-	"mc-gateway/internal/mcproto"
+	"github.com/difof/mcs-bootloader/internal/control"
+	"github.com/difof/mcs-bootloader/internal/mcproto"
 )
 
 func TestReconfigurePreservesOpaqueRelayAndChangesAdmissionLimit(t *testing.T) {

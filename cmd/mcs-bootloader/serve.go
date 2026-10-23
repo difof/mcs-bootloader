@@ -16,10 +16,10 @@ import (
 	"syscall"
 	"time"
 
-	"mc-gateway/internal/backend"
-	"mc-gateway/internal/control"
-	"mc-gateway/internal/gateway"
-	"mc-gateway/internal/rcon"
+	"github.com/difof/mcs-bootloader/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/control"
+	"github.com/difof/mcs-bootloader/internal/gateway"
+	"github.com/difof/mcs-bootloader/internal/rcon"
 )
 
 func serve(configPath string) error {
@@ -68,7 +68,7 @@ func serve(configPath string) error {
 		log.Warn("status_cache_unavailable", "error", err.Error())
 	}
 	s := gateway.New(trafficConfig(cfg), c, log)
-	runtime := &runtimeConfig{cfg: cfg, path: configPath, digest: digest, generation: 1,
+	runtime := &runtimeConfig{cfg: cfg.Clone(), path: configPath, digest: digest, generation: 1,
 		controller: c, gateway: s, backend: b, level: level, log: log}
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

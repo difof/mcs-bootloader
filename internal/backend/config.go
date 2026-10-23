@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 type Duration time.Duration
@@ -45,9 +47,8 @@ type Config struct {
 	StateDirectory    string   `json:"state_directory"`
 	AdminSocket       string   `json:"admin_socket"`
 	ServerDirectory   string   `json:"server_directory"`
-	JavaBinary        string   `json:"java_binary"`
-	JVMArgFile        string   `json:"jvm_argfile"`
-	ServerArgFile     string   `json:"server_argfile"`
+	LaunchExecutable  string   `json:"launch_executable"`
+	LaunchArgs        []string `json:"launch_args"`
 	Protocol          int      `json:"protocol"`
 	Version           string   `json:"version"`
 	MaxPlayers        int      `json:"max_players"`
@@ -70,9 +71,9 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Listen: ":25565", BackendAddress: "127.0.0.1:25566", RCONAddress: "127.0.0.1:25575",
-		RCONPasswordFile: "/etc/mc-gateway/rcon.password", Service: "mc-gateway-backend.service",
-		StateDirectory: "/var/lib/mc-gateway", AdminSocket: "/run/mc-gateway/control.sock",
-		ServerDirectory: "/srv/minecraft", JavaBinary: "/usr/bin/java", JVMArgFile: "@user_jvm_args.txt",
+		RCONPasswordFile: "/etc/mcs-bootloader/rcon.password", Service: "mcs-bootloader-backend.service",
+		StateDirectory: "/var/lib/mcs-bootloader", AdminSocket: "/run/mcs-bootloader/control.sock",
+		ServerDirectory: "/srv/minecraft", LaunchExecutable: "/usr/bin/java", LaunchArgs: []string{"-jar", "server.jar", "nogui"},
 		Protocol: 767, Version: "1.21.1", MaxPlayers: 5, MaxConnections: 64,
 		IdleTimeout: Duration(time.Hour), PollInterval: Duration(15 * time.Second), OperationTimeout: Duration(5 * time.Second),
 		StartupTimeout: Duration(15 * time.Minute), ShutdownWarnAfter: Duration(3 * time.Minute), WakeCooldown: Duration(30 * time.Second),
@@ -153,7 +154,7 @@ func (c Config) Validate() error {
 	if !servicePattern.MatchString(c.Service) {
 		return fmt.Errorf("invalid backend service name")
 	}
-	paths := []string{c.StateDirectory, c.AdminSocket, c.ServerDirectory, c.JavaBinary}
+	paths := []string{c.StateDirectory, c.AdminSocket, c.ServerDirectory}
 	if c.RCONPassword != "" {
 		if err := validatePassword(c.RCONPassword); err != nil {
 			return err
@@ -168,6 +169,9 @@ func (c Config) Validate() error {
 		if strings.ContainsAny(path, "\x00\r\n") {
 			return fmt.Errorf("runtime paths must not contain NUL or line breaks")
 		}
+	}
+	if err := c.validateLaunch(); err != nil {
+		return err
 	}
 	if c.Protocol != 767 {
 		return fmt.Errorf("this release supports Minecraft 1.21.1 protocol 767; other versions require compatibility tests")
@@ -190,6 +194,36 @@ func (c Config) Validate() error {
 		if len(message) == 0 || len(message) > 4096 {
 			return fmt.Errorf("messages must contain 1-4096 bytes")
 		}
+	}
+	return nil
+}
+
+// Clone keeps each applied configuration snapshot independent of callers.
+func (c Config) Clone() Config {
+	c.LaunchArgs = slices.Clone(c.LaunchArgs)
+	return c
+}
+
+const maxLaunchArgs = 256
+const maxLaunchBytes = 32768
+
+func (c Config) validateLaunch() error {
+	if strings.TrimSpace(c.LaunchExecutable) == "" || len(c.LaunchExecutable) > 4096 ||
+		strings.ContainsAny(c.LaunchExecutable, "\x00\r\n") || !utf8.ValidString(c.LaunchExecutable) {
+		return fmt.Errorf("MC_LAUNCH_EXECUTABLE must be a nonempty valid UTF-8 path of at most 4096 bytes without NUL or line breaks")
+	}
+	if c.LaunchArgs == nil || len(c.LaunchArgs) > maxLaunchArgs {
+		return fmt.Errorf("MC_LAUNCH_ARGS must be a JSON array containing at most 256 strings")
+	}
+	total := 0
+	for _, arg := range c.LaunchArgs {
+		total += len(arg)
+		if strings.ContainsAny(arg, "\x00\r\n") || !utf8.ValidString(arg) {
+			return fmt.Errorf("MC_LAUNCH_ARGS strings must contain valid UTF-8 without NUL or line breaks")
+		}
+	}
+	if total > maxLaunchBytes {
+		return fmt.Errorf("MC_LAUNCH_ARGS must contain at most 32768 UTF-8 bytes in total")
 	}
 	return nil
 }

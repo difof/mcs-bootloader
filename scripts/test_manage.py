@@ -34,8 +34,8 @@ class InstallationTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.destination = self.root / "mc-gateway"
-        self.previous = self.root / "mc-gateway.previous"
+        self.destination = self.root / "mcs-bootloader"
+        self.previous = self.root / "mcs-bootloader.previous"
         self.source = self.root / "candidate"
         self.config = self.root / ".env"
         self.config.write_text("MC_RCON_PASSWORD='synthetic-private-password'\n")
@@ -100,7 +100,7 @@ class InstallationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid idle timeout"):
             self.deploy()
         self.assertEqual(before, (fingerprint(self.destination), fingerprint(self.previous)))
-        self.assertFalse(list(self.root.glob(".mc-gateway-check-*")))
+        self.assertFalse(list(self.root.glob(".mcs-bootloader-check-*")))
         self.fchown.assert_not_called()
 
     def test_expected_hash_mismatch_aborts_before_validation_or_writes(self):
@@ -166,9 +166,9 @@ class OperatorTests(unittest.TestCase):
         self.values = {
             "MC_BINARY": str(self.directory / "installed executable"),
             "MC_CONFIG": str(self.canonical),
-            "MC_SERVICE_USER": "compute",
+            "MC_SERVICE_USER": "gamesvc",
             "MC_COMMAND_TIMEOUT": "45s",
-            "MC_ADMIN_SOCKET": "/run/mc-gateway/control.sock",
+            "MC_ADMIN_SOCKET": "/run/mcs-bootloader/control.sock",
             "MC_BACKEND_SERVICE": "minecraft-backend.service",
             "MC_RCON_PASSWORD": self.secret,
             "MC_IDLE_TIMEOUT": "2h",
@@ -202,7 +202,7 @@ class OperatorTests(unittest.TestCase):
             with self.subTest(action=action):
                 with self.assertRaises(ExecRequested) as launched:
                     manage.operate(action, [])
-                expected = ["sudo", "-n", "-u", "compute", "--", self.values["MC_BINARY"], operation]
+                expected = ["sudo", "-n", "-u", "gamesvc", "--", self.values["MC_BINARY"], operation]
                 if operation != "version":
                     expected += ["--socket", self.values["MC_ADMIN_SOCKET"]]
                 self.assertEqual(launched.exception.program, "sudo")
@@ -217,7 +217,7 @@ class OperatorTests(unittest.TestCase):
             manage.operate("command", arguments)
         self.assertEqual(launched.exception.program, "sudo")
         self.assertEqual(launched.exception.argv, [
-            "sudo", "-n", "-u", "compute", "--", self.values["MC_BINARY"],
+            "sudo", "-n", "-u", "gamesvc", "--", self.values["MC_BINARY"],
             "command", "--socket", self.values["MC_ADMIN_SOCKET"], "--timeout", "45s", "--",
         ] + arguments)
         self.assertNotIn(self.secret, " ".join(launched.exception.argv))
@@ -232,7 +232,7 @@ class OperatorTests(unittest.TestCase):
             with self.subTest(action=action), contextlib.redirect_stdout(io.StringIO()):
                 self.process.reset_mock()
                 manage.operate(action, [])
-                argv = ["sudo", "-n", "-u", "compute", "--", self.values["MC_BINARY"]]
+                argv = ["sudo", "-n", "-u", "gamesvc", "--", self.values["MC_BINARY"]]
                 if action == "config-check":
                     argv += ["check", "--config", str(self.canonical)]
                 else:
@@ -308,7 +308,7 @@ class OperatorTests(unittest.TestCase):
         with self.assertRaises(ExecRequested) as launched:
             manage.operate("logs-server-follow", [])
         self.assertEqual(launched.exception.argv, [
-            "sudo", "-n", "--", "journalctl", "--namespace=mc-gateway",
+            "sudo", "-n", "--", "journalctl", "--namespace=mcs-bootloader",
             "-u", "minecraft-backend.service", "-n", "100", "-o", "cat", "-f",
         ])
         self.process.assert_not_called()
@@ -326,12 +326,12 @@ class OperatorTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             manage.operate("gateway-restart", [])
         self.assertEqual(observed, [
-            ["sudo", "-n", "--", "systemctl", "show", "mc-gateway.service",
+            ["sudo", "-n", "--", "systemctl", "show", "mcs-bootloader.service",
              "--property=ActiveState", "--value"],
-            ["sudo", "-n", "-u", "compute", "--", self.values["MC_BINARY"],
+            ["sudo", "-n", "-u", "gamesvc", "--", self.values["MC_BINARY"],
              "restart-check", "--socket", self.values["MC_ADMIN_SOCKET"],
              "--config", str(self.canonical)],
-            ["sudo", "-n", "--", "systemctl", "restart", "mc-gateway.service"],
+            ["sudo", "-n", "--", "systemctl", "restart", "mcs-bootloader.service"],
         ])
         self.assertNotIn(self.secret, str(observed))
 
@@ -370,11 +370,11 @@ class OperatorTests(unittest.TestCase):
                 if state in ("inactive", "failed"):
                     manage.operate("gateway-restart", [])
                     self.assertEqual(observed[1], [
-                        "sudo", "-n", "-u", "compute", "--", self.values["MC_BINARY"],
+                        "sudo", "-n", "-u", "gamesvc", "--", self.values["MC_BINARY"],
                         "check", "--config", str(self.canonical),
                     ])
                     self.assertEqual(observed[2], [
-                        "sudo", "-n", "--", "systemctl", "restart", "mc-gateway.service",
+                        "sudo", "-n", "--", "systemctl", "restart", "mcs-bootloader.service",
                     ])
                 else:
                     with self.assertRaisesRegex(RuntimeError, "stopping or unknown"):
@@ -382,7 +382,7 @@ class OperatorTests(unittest.TestCase):
                     self.assertEqual(len(observed), 1)
 
     def test_deploy_validates_and_installs_without_start_stop_or_restart(self):
-        source = self.root / "bin" / "mc-gateway"
+        source = self.root / "bin" / "mcs-bootloader"
         source.parent.mkdir()
         source.write_bytes(b"\x7fELFnew candidate")
         destination = Path(self.values["MC_BINARY"])

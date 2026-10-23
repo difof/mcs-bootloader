@@ -11,15 +11,14 @@ import (
 	"testing"
 )
 
-func temporaryJavaConfig(t *testing.T) Config {
+func temporaryLaunchConfig(t *testing.T) Config {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.RCONPassword = testEnvPassword
 	cfg.RCONPasswordFile = ""
 	cfg.ServerDirectory = t.TempDir()
-	cfg.JavaBinary = filepath.Join(cfg.ServerDirectory, "java-test-only")
-	cfg.JVMArgFile = "@user_jvm_args.txt"
-	cfg.ServerArgFile = "@libraries/loader/unix_args.txt"
+	cfg.LaunchExecutable = filepath.Join(cfg.ServerDirectory, "java-test-only")
+	cfg.LaunchArgs = []string{"@user_jvm_args.txt", "@libraries/loader/unix_args.txt", "nogui"}
 	if err := os.MkdirAll(filepath.Join(cfg.ServerDirectory, "libraries/loader"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -50,8 +49,8 @@ func temporaryJavaConfig(t *testing.T) Config {
 	return cfg
 }
 
-func TestJavaPreflightKeepsArgumentsOpaqueAndReservesPorts(t *testing.T) {
-	cfg := temporaryJavaConfig(t)
+func TestLaunchPreflightKeepsArgumentsOpaqueAndReservesPorts(t *testing.T) {
+	cfg := temporaryLaunchConfig(t)
 	path := filepath.Join(cfg.ServerDirectory, "server.properties")
 	before, err := os.ReadFile(path)
 	if err != nil {
@@ -61,14 +60,14 @@ func TestJavaPreflightKeepsArgumentsOpaqueAndReservesPorts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	launch, err := prepareJava(cfg)
+	launch, err := prepareLaunch(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer launch.releasePorts()
-	want := []string{cfg.JavaBinary, cfg.JVMArgFile, cfg.ServerArgFile, "nogui"}
+	want := append([]string{cfg.LaunchExecutable}, cfg.LaunchArgs...)
 	if !reflect.DeepEqual(launch.args, want) {
-		t.Fatal("Java arguments were changed")
+		t.Fatal("launch arguments were changed")
 	}
 	for _, address := range []string{cfg.BackendAddress, cfg.RCONAddress} {
 		listener, err := net.Listen("tcp", address)
@@ -95,10 +94,10 @@ func TestJavaPreflightKeepsArgumentsOpaqueAndReservesPorts(t *testing.T) {
 	}
 }
 
-func TestJavaPreflightRefusesOccupiedPortsWithoutMutation(t *testing.T) {
+func TestLaunchPreflightRefusesOccupiedPortsWithoutMutation(t *testing.T) {
 	for _, name := range []string{"backend", "RCON"} {
 		t.Run(name, func(t *testing.T) {
-			cfg := temporaryJavaConfig(t)
+			cfg := temporaryLaunchConfig(t)
 			address := cfg.BackendAddress
 			if name == "RCON" {
 				address = cfg.RCONAddress
@@ -113,7 +112,7 @@ func TestJavaPreflightRefusesOccupiedPortsWithoutMutation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			launch, err := prepareJava(cfg)
+			launch, err := prepareLaunch(cfg)
 			if err == nil {
 				launch.releasePorts()
 				t.Fatal("occupied private port allowed a launch")
@@ -136,28 +135,29 @@ func TestJavaPreflightRefusesOccupiedPortsWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestJavaPreflightRejectsInvalidStartupFiles(t *testing.T) {
+func TestLaunchPreflightRejectsInvalidStartupFiles(t *testing.T) {
 	cases := map[string]func(*Config){
-		"missing directory":   func(c *Config) { c.ServerDirectory = filepath.Join(c.ServerDirectory, "missing") },
-		"missing Java":        func(c *Config) { c.JavaBinary = filepath.Join(c.ServerDirectory, "missing") },
-		"non-executable Java": func(c *Config) { c.JavaBinary = filepath.Join(c.ServerDirectory, "user_jvm_args.txt") },
-		"missing JVM file":    func(c *Config) { c.JVMArgFile = "@missing" },
-		"empty loader":        func(c *Config) { c.ServerArgFile = "" },
-		"loader not argfile":  func(c *Config) { c.ServerArgFile = "-jar" },
-		"escaped at sign":     func(c *Config) { c.ServerArgFile = "@@libraries/loader/unix_args.txt" },
-		"loader directory":    func(c *Config) { c.ServerArgFile = "@libraries" },
-		"loader newline":      func(c *Config) { c.ServerArgFile = "@libraries/loader/unix_args.txt\nextra" },
+		"missing directory":    func(c *Config) { c.ServerDirectory = filepath.Join(c.ServerDirectory, "missing") },
+		"missing executable":   func(c *Config) { c.LaunchExecutable = filepath.Join(c.ServerDirectory, "missing") },
+		"non-executable file":  func(c *Config) { c.LaunchExecutable = filepath.Join(c.ServerDirectory, "user_jvm_args.txt") },
+		"executable directory": func(c *Config) { c.LaunchExecutable = c.ServerDirectory },
+		"empty executable":     func(c *Config) { c.LaunchExecutable = "" },
+		"NUL executable":       func(c *Config) { c.LaunchExecutable += "\x00" },
+		"null arguments":       func(c *Config) { c.LaunchArgs = nil },
+		"newline argument":     func(c *Config) { c.LaunchArgs = []string{"line\nextra"} },
+		"NUL argument":         func(c *Config) { c.LaunchArgs = []string{"arg\x00extra"} },
 	}
+
 	for name, change := range cases {
 		t.Run(name, func(t *testing.T) {
-			cfg := temporaryJavaConfig(t)
+			cfg := temporaryLaunchConfig(t)
 			path := filepath.Join(cfg.ServerDirectory, "server.properties")
 			before, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
 			change(&cfg)
-			launch, err := prepareJava(cfg)
+			launch, err := prepareLaunch(cfg)
 			if err == nil {
 				launch.releasePorts()
 				t.Fatal("invalid startup setting accepted")
@@ -167,6 +167,26 @@ func TestJavaPreflightRejectsInvalidStartupFiles(t *testing.T) {
 				t.Fatal("invalid startup setting changed properties")
 			}
 		})
+	}
+}
+
+func TestLaunchPreflightResolvesExecutableAndCopiesLiteralArguments(t *testing.T) {
+	cfg := temporaryLaunchConfig(t)
+	cfg.LaunchExecutable = "./java-test-only"
+	cfg.LaunchArgs = []string{"@missing-is-literal", "", "$(never-expanded)", "a b", "--flag=value"}
+	launch, err := prepareLaunch(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer launch.releasePorts()
+	wantBinary := filepath.Join(cfg.ServerDirectory, "java-test-only")
+	want := append([]string{wantBinary}, cfg.LaunchArgs...)
+	if launch.binary != wantBinary || !reflect.DeepEqual(launch.args, want) {
+		t.Fatal("executable was not resolved relative to the server root or arguments were changed")
+	}
+	cfg.LaunchArgs[0] = "changed-after-preflight"
+	if !reflect.DeepEqual(launch.args, want) {
+		t.Fatal("preflight retained mutable caller argument storage")
 	}
 }
 
@@ -228,7 +248,7 @@ func TestReplaceRCONPasswordTouchesOnlyCredential(t *testing.T) {
 }
 
 func TestSyncPasswordAtomicPreservationAndNoop(t *testing.T) {
-	cfg := temporaryJavaConfig(t)
+	cfg := temporaryLaunchConfig(t)
 	path := filepath.Join(cfg.ServerDirectory, "server.properties")
 	original, err := os.Stat(path)
 	if err != nil {
@@ -265,7 +285,7 @@ func TestSyncPasswordAtomicPreservationAndNoop(t *testing.T) {
 	if err != nil || !os.SameFile(updated, final) || !updated.ModTime().Equal(final.ModTime()) {
 		t.Fatal("matching properties file metadata changed")
 	}
-	temps, err := filepath.Glob(filepath.Join(cfg.ServerDirectory, ".mc-gateway-properties-*"))
+	temps, err := filepath.Glob(filepath.Join(cfg.ServerDirectory, ".mcs-bootloader-properties-*"))
 	if err != nil || len(temps) != 0 {
 		t.Fatal("password synchronization left a temporary secret copy")
 	}

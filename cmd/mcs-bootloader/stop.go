@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"mc-gateway/internal/backend"
-	"mc-gateway/internal/rcon"
+	"github.com/difof/mcs-bootloader/internal/backend"
+	"github.com/difof/mcs-bootloader/internal/rcon"
 )
 
 // systemd invokes this helper before stopping the backend. It cannot escalate to

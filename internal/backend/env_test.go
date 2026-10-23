@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -20,13 +21,12 @@ func TestLoadEnvSharedSchemaAndLiterals(t *testing.T) {
 export MC_LISTEN = ":25565" # public gateway
 MC_BACKEND_ADDRESS='127.0.0.1:25566'
 MC_RCON_ADDRESS=127.0.0.1:25575
-MC_BACKEND_SERVICE=mc-gateway-backend.service
-MC_STATE_DIRECTORY=/var/lib/mc-gateway
-MC_ADMIN_SOCKET=/run/mc-gateway/control.sock
+MC_BACKEND_SERVICE=mcs-bootloader-backend.service
+MC_STATE_DIRECTORY=/var/lib/mcs-bootloader
+MC_ADMIN_SOCKET=/run/mcs-bootloader/control.sock
 MC_SERVER_DIRECTORY=/srv/minecraft
-MC_JAVA_BINARY=/usr/bin/java
-MC_JVM_ARGFILE=@user_jvm_args.txt
-MC_SERVER_ARGFILE=@libraries/loader/unix_args.txt
+MC_LAUNCH_EXECUTABLE=/usr/bin/java
+MC_LAUNCH_ARGS='["@user_jvm_args.txt","@libraries/loader/unix_args.txt","nogui"]' 
 MC_PROTOCOL=000767
 MC_VERSION=1.21.1
 MC_MAX_PLAYERS="8"
@@ -44,11 +44,11 @@ MC_SLEEPING_MOTD='sleep $HOME $(do-not-run) # literal'
 MC_STARTING_MOTD=Booting#literal
 MC_FAILED_MOTD=Try later # ignored comment
 MC_LOG_LEVEL=debug
-MC_BINARY=/opt/mc-gateway/bin/mc-gateway
-MC_CONFIG=/etc/mc-gateway/.env
-MC_SERVICE_USER=compute
-MC_GATEWAY_SERVICE=mc-gateway.service
-MC_LOG_NAMESPACE=mc-gateway
+MC_BINARY=/opt/mcs-bootloader/bin/mcs-bootloader
+MC_CONFIG=/etc/mcs-bootloader/.env
+MC_SERVICE_USER=gamesvc
+MC_GATEWAY_SERVICE=mcs-bootloader.service
+MC_LOG_NAMESPACE=mcs-bootloader
 MC_LOG_LINES=100
 MC_COMMAND_TIMEOUT=30s
 MC_BACKUP_DIRECTORY=/srv/minecraft-backups/pre-gateway
@@ -67,7 +67,7 @@ MC_BACKUP_DIRECTORY=/srv/minecraft-backups/pre-gateway
 	if cfg.Protocol != 767 || cfg.MaxPlayers != 8 || cfg.IdleTimeout != Duration(2*time.Hour) || cfg.PollInterval != Duration(30*time.Second) {
 		t.Fatal("typed settings did not load")
 	}
-	if cfg.ServerArgFile != "@libraries/loader/unix_args.txt" || cfg.LogLevel != "debug" {
+	if cfg.LaunchExecutable != "/usr/bin/java" || !reflect.DeepEqual(cfg.LaunchArgs, []string{"@user_jvm_args.txt", "@libraries/loader/unix_args.txt", "nogui"}) || cfg.LogLevel != "debug" {
 		t.Fatal("startup/log settings did not load")
 	}
 	if cfg.BootMessage != "Booting\nPlease wait 🚀" || cfg.SleepingMOTD != "sleep $HOME $(do-not-run) # literal" || cfg.StartingMOTD != "Booting#literal" || cfg.FailedMOTD != "Try later" {
@@ -211,5 +211,41 @@ func TestInlinePasswordValidationAndPortAliases(t *testing.T) {
 	cfg.RCONAddress = "127.0.0.1:025566"
 	if cfg.Validate() == nil {
 		t.Fatal("aliased duplicate private port accepted")
+	}
+}
+
+func TestLaunchArgumentsAreLiteralTypedAndBounded(t *testing.T) {
+	want := []string{"", "space argument", "@unread-file", "${HOME}", "$(touch never)", "literal ' quote", "🚀"}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// JSON double quoting also permits an argument containing an apostrophe;
+	// no shell parser participates in either decoding layer.
+	quoted, err := json.Marshal(string(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadEnv(envWith("MC_LAUNCH_EXECUTABLE=./launch.sh\nMC_LAUNCH_ARGS=" + string(quoted)))
+	if err != nil || cfg.LaunchExecutable != "./launch.sh" || !reflect.DeepEqual(cfg.LaunchArgs, want) {
+		t.Fatalf("literal argument parsing failed: %v", err)
+	}
+	tooMany, _ := json.Marshal(make([]string, maxLaunchArgs+1))
+	tooLarge, _ := json.Marshal([]string{strings.Repeat("x", maxLaunchBytes+1)})
+	for _, value := range []string{
+		`null`, `{}`, `"-jar server.jar"`, `[null]`, `[1]`, `[true]`, `[["nested"]]`,
+		`["a"] false`, `["\u0000"]`, `["line\nfeed"]`, `["\r"]`,
+		`["\ud800"]`, `["\udfff"]`, `["\ud800\u0041"]`, string(tooMany), string(tooLarge),
+	} {
+		if _, err := LoadEnv(envWith("MC_LAUNCH_ARGS='" + value + "'")); err == nil {
+			t.Errorf("invalid launch arguments were accepted: %.80s", value)
+		}
+	}
+	cfg, err = LoadEnv(envWith("MC_LAUNCH_ARGS=[]"))
+	if err != nil || cfg.LaunchArgs == nil || len(cfg.LaunchArgs) != 0 {
+		t.Fatalf("empty argument array was not preserved: %v", err)
+	}
+	if got := cfg.Clone(); got.LaunchArgs == nil {
+		t.Fatal("cloning an empty array turned it into null")
 	}
 }

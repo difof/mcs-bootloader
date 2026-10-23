@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"mc-gateway/internal/control"
+	"github.com/difof/mcs-bootloader/internal/control"
 )
 
 // status edits only lifecycle display fields. Unknown top-level and nested

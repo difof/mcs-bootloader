@@ -32,23 +32,21 @@ func LoadEnv(data []byte) (Config, error) {
 		return c, fmt.Errorf("environment file must contain valid UTF-8")
 	}
 	stringFields := map[string]*string{
-		"MC_LISTEN":           &c.Listen,
-		"MC_BACKEND_ADDRESS":  &c.BackendAddress,
-		"MC_RCON_ADDRESS":     &c.RCONAddress,
-		"MC_RCON_PASSWORD":    &c.RCONPassword,
-		"MC_BACKEND_SERVICE":  &c.Service,
-		"MC_STATE_DIRECTORY":  &c.StateDirectory,
-		"MC_ADMIN_SOCKET":     &c.AdminSocket,
-		"MC_SERVER_DIRECTORY": &c.ServerDirectory,
-		"MC_JAVA_BINARY":      &c.JavaBinary,
-		"MC_JVM_ARGFILE":      &c.JVMArgFile,
-		"MC_SERVER_ARGFILE":   &c.ServerArgFile,
-		"MC_VERSION":          &c.Version,
-		"MC_BOOT_MESSAGE":     &c.BootMessage,
-		"MC_SLEEPING_MOTD":    &c.SleepingMOTD,
-		"MC_STARTING_MOTD":    &c.StartingMOTD,
-		"MC_FAILED_MOTD":      &c.FailedMOTD,
-		"MC_LOG_LEVEL":        &c.LogLevel,
+		"MC_LISTEN":            &c.Listen,
+		"MC_BACKEND_ADDRESS":   &c.BackendAddress,
+		"MC_RCON_ADDRESS":      &c.RCONAddress,
+		"MC_RCON_PASSWORD":     &c.RCONPassword,
+		"MC_BACKEND_SERVICE":   &c.Service,
+		"MC_STATE_DIRECTORY":   &c.StateDirectory,
+		"MC_ADMIN_SOCKET":      &c.AdminSocket,
+		"MC_SERVER_DIRECTORY":  &c.ServerDirectory,
+		"MC_LAUNCH_EXECUTABLE": &c.LaunchExecutable,
+		"MC_VERSION":           &c.Version,
+		"MC_BOOT_MESSAGE":      &c.BootMessage,
+		"MC_SLEEPING_MOTD":     &c.SleepingMOTD,
+		"MC_STARTING_MOTD":     &c.StartingMOTD,
+		"MC_FAILED_MOTD":       &c.FailedMOTD,
+		"MC_LOG_LEVEL":         &c.LogLevel,
 	}
 	durationFields := map[string]*Duration{
 		"MC_IDLE_TIMEOUT":        &c.IdleTimeout,
@@ -87,7 +85,7 @@ func LoadEnv(data []byte) (Config, error) {
 			return c, envError(number, "", "expected KEY=value")
 		}
 		key, literal := parts[1], parts[2]
-		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && !taskFields[key] {
+		if stringFields[key] == nil && durationFields[key] == nil && integerFields[key] == nil && !taskFields[key] && key != "MC_LAUNCH_ARGS" {
 			return c, envError(number, key, "unknown setting")
 		}
 		if seen[key] {
@@ -117,6 +115,20 @@ func LoadEnv(data []byte) (Config, error) {
 		}
 		if err := validateEnvString(key, value); err != nil {
 			return c, envError(number, key, err.Error())
+		}
+		if key == "MC_LAUNCH_ARGS" {
+			var encoded []json.RawMessage
+			if err := json.Unmarshal([]byte(value), &encoded); err != nil || encoded == nil || len(encoded) > maxLaunchArgs || !validJSONSurrogates(value) {
+				return c, envError(number, key, "must be a JSON array containing at most 256 valid Unicode strings")
+			}
+			args := make([]string, len(encoded))
+			for i, raw := range encoded {
+				if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &args[i]) != nil {
+					return c, envError(number, key, "every array item must be a string")
+				}
+			}
+			c.LaunchArgs = args
+			continue
 		}
 		if target := stringFields[key]; target != nil {
 			*target = value

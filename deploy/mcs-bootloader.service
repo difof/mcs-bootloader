@@ -9,13 +9,13 @@ Type=exec
 User=minecraft
 Group=minecraft
 WorkingDirectory=/
-ExecStart=/opt/mc-gateway/bin/mc-gateway serve --config /etc/mc-gateway/.env
+ExecStart=/opt/mcs-bootloader/bin/mcs-bootloader serve --config /etc/mcs-bootloader/.env
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
-RuntimeDirectory=mc-gateway
+RuntimeDirectory=mcs-bootloader
 RuntimeDirectoryMode=0700
-StateDirectory=mc-gateway
+StateDirectory=mcs-bootloader
 StateDirectoryMode=0700
 UMask=0077
 PrivateTmp=true
@@ -24,7 +24,7 @@ ProtectHome=true
 # A narrowly scoped sudo rule starts only the backend unit.
 # NoNewPrivileges would disable that rule.
 NoNewPrivileges=false
-LogNamespace=mc-gateway
+LogNamespace=mcs-bootloader
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=200
 
