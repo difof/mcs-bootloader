@@ -20,48 +20,122 @@ tasks:
     cmds:
       - go vet ./...
   test:
-    desc: Run protocol, transport, and lifecycle race tests
+    desc: Run protocol, transport, lifecycle, and operator race tests
     cmds:
       - go test -race -count=1 -timeout=90s ./...
   check:
-    desc: Check formatting, static analysis, and race tests
+    desc: Check formatting, static analysis, race tests, and operator configuration
     cmds:
       - task: fmt:check
       - task: vet
       - task: test
       - python3 -m unittest discover -s scripts -p 'test_*.py'
   build:
-    desc: Build the daemon and local admin client
+    desc: Build the daemon and local admin/command client
     cmds:
       - mkdir -p bin
-      - go build -trimpath -ldflags '-s -w -X main.version={{.VERSION}}' -o bin/mc-gateway ./cmd/mc-gateway
+      - go build -trimpath -ldflags {{printf "-s -w -X main.version=%s" .VERSION | shellQuote}} -o bin/mc-gateway ./cmd/mc-gateway
   fuzz:handshake:
     desc: Fuzz handshake framing for 10 seconds
     cmds:
       - go test ./internal/mcproto -run '^$' -fuzz '^FuzzReadHandshake$' -fuzztime=10s -parallel=2
   install:
-    desc: Install using a private plan after verifying the stopped server and backup
+    desc: First install only; verify stopped server and backup using a private plan
     cmds:
       - task: check
       - task: build
       - sudo -n python3 scripts/install.py --plan .local/install.json --report .local/installation.json
-  status:
-    desc: Inspect the deployed gateway
+      - task: config:init
+  deploy:
+    desc: Check, build, and install an update; leave running gateway and Java untouched
     cmds:
-      - sudo -n /opt/mc-gateway/bin/mc-gateway status
+      - task: check
+      - task: build
+      - python3 scripts/manage.py deploy
+  status:
+    desc: Show Minecraft state, player health, connections, and gateway version
+    silent: true
+    cmds:
+      - python3 scripts/manage.py status {{.CLI_ARGS}}
+  version:
+    desc: Show the installed executable version (running daemon version is in status)
+    silent: true
+    cmds:
+      - python3 scripts/manage.py version {{.CLI_ARGS}}
+  start:
+    aliases: [wake]
+    desc: Start Minecraft once; joining also wakes it automatically
+    silent: true
+    cmds:
+      - python3 scripts/manage.py start {{.CLI_ARGS}}
+  stop:
+    aliases: [sleep]
+    desc: Save and stop when empty; refuses active players/joins; future login wakes it
+    silent: true
+    cmds:
+      - python3 scripts/manage.py stop {{.CLI_ARGS}}
+  command:
+    desc: 'Send a local RCON console command: task command -- op PlayerName'
+    silent: true
+    cmds:
+      - python3 scripts/manage.py command -- {{.CLI_ARGS}}
   logs:
     desc: Show recent gateway state and connection events
+    silent: true
     cmds:
-      - sudo -n journalctl --namespace=mc-gateway -u mc-gateway.service -n 100 --no-pager -o cat
+      - python3 scripts/manage.py logs {{.CLI_ARGS}}
   logs:follow:
-    desc: Follow gateway events
+    desc: Follow gateway events (Ctrl+C exits the viewer)
+    silent: true
     cmds:
-      - sudo -n journalctl --namespace=mc-gateway -u mc-gateway.service -f -o cat
-  wake:
-    desc: Request one backend startup
+      - python3 scripts/manage.py logs-follow {{.CLI_ARGS}}
+  logs:server:
+    desc: Show recent Minecraft console output
+    silent: true
     cmds:
-      - sudo -n /opt/mc-gateway/bin/mc-gateway wake
-  sleep:
-    desc: Gracefully stop only if player checks confirm empty and no joins are active
+      - python3 scripts/manage.py logs-server {{.CLI_ARGS}}
+  logs:server:follow:
+    desc: Follow Minecraft console output (Ctrl+C exits the viewer)
+    silent: true
     cmds:
-      - sudo -n /opt/mc-gateway/bin/mc-gateway sleep
+      - python3 scripts/manage.py logs-server-follow {{.CLI_ARGS}}
+  config:init:
+    desc: Create a private .env from installed settings without overwriting an existing file
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-init {{.CLI_ARGS}}
+  config:edit:
+    desc: Edit .env using VISUAL, EDITOR, or nano
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-edit {{.CLI_ARGS}}
+  config:show:
+    desc: Show proposed settings from .env (no password contents)
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-show {{.CLI_ARGS}}
+  config:check:
+    desc: Validate .env and protected credentials without changing files or services
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-check {{.CLI_ARGS}}
+  config:apply:
+    desc: Save validated .env settings atomically; effective after explicit gateway restart
+    silent: true
+    cmds:
+      - python3 scripts/manage.py config-apply {{.CLI_ARGS}}
+  gateway:start:
+    desc: Start the gateway service (does not directly start Minecraft)
+    silent: true
+    cmds:
+      - python3 scripts/manage.py gateway-start {{.CLI_ARGS}}
+  gateway:stop:
+    desc: Stop gateway and disconnect clients; leave Java running; disables wake until started
+    silent: true
+    cmds:
+      - python3 scripts/manage.py gateway-stop {{.CLI_ARGS}}
+  gateway:restart:
+    desc: Restart gateway to load settings/code; disconnect clients; leave Java running
+    silent: true
+    cmds:
+      - python3 scripts/manage.py gateway-restart {{.CLI_ARGS}}

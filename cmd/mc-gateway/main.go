@@ -28,6 +28,9 @@ func run(args []string) error {
 		fmt.Println(version)
 		return nil
 	}
+	if command == "command" {
+		return runCommand(args, os.Stdout)
+	}
 	if command == "status" || command == "wake" || command == "sleep" {
 		return adminClient(command, args)
 	}
@@ -64,6 +67,6 @@ func run(args []string) error {
 		}
 		return gracefulBackendStop(cfg, pid)
 	default:
-		return fmt.Errorf("unknown command %q; use serve, check, status, wake, sleep, backend-stop, or version", command)
+		return fmt.Errorf("unknown command %q; use serve, check, status, wake, sleep, command, backend-stop, or version", command)
 	}
 }
