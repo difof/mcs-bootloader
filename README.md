@@ -66,6 +66,12 @@ prints the reply, then closes it. It does not automatically wake Minecraft or
 retry a command whose reply was lost. A failed response can mean the command
 already executed; inspect state before repeating a command with side effects.
 
+The command task reads the invoking Task process's original arguments through
+Linux `/proc`, avoiding Task 3.44's recursive substitution inside its CLI argument
+variables. This preserves literal `{{...}}` text when Task starts the command.
+Task can still reject some template expressions during its own initialization;
+such an error prevents the command from reaching Minecraft.
+
 `task stop` refuses occupied servers, pending/active joins, and unknown player
 counts. It is a safe sleep request, not a maintenance lock: a later login wakes
 the server again. If you intentionally need the console's ordinary stop command

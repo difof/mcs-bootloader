@@ -347,7 +347,8 @@ func TestCancellationClosesRelayAndReleasesLease(t *testing.T) {
 	}
 	defer backend.Close()
 	controller := &fakeController{state: control.Ready, healthy: true}
-	_, address, cancel := startGateway(t, Config{BackendAddress: backend.Addr().String()}, controller)
+	server, address, cancel := startGateway(t, Config{BackendAddress: backend.Addr().String()}, controller)
+	backendAccepted := make(chan struct{})
 	backendDone := make(chan error, 1)
 	go func() {
 		conn, err := backend.Accept()
@@ -356,6 +357,7 @@ func TestCancellationClosesRelayAndReleasesLease(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		close(backendAccepted)
 		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 		_, err = io.Copy(io.Discard, conn)
 		backendDone <- err
@@ -364,12 +366,27 @@ func TestCancellationClosesRelayAndReleasesLease(t *testing.T) {
 	if err := writeAll(client, append(handshakePacket("friends.example", 2), loginPacket("Mzar")...)); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, func() bool { return controller.Snapshot().ActiveConnections == 1 })
+	// A join lease is acquired before DialContext. Cancelling at that point
+	// can correctly abort the dial and leave the fixture waiting in Accept.
+	// Exercise cancellation of an established relay instead.
+	select {
+	case <-backendAccepted:
+	case err := <-backendDone:
+		t.Fatalf("backend stopped before accepting the relay: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("backend did not accept the relay")
+	}
+	eventually(t, func() bool { return server.Stats().Routed == 1 && controller.Snapshot().ActiveConnections == 1 })
 	cancel()
 	_, _ = io.ReadAll(client)
 	eventually(t, func() bool { return controller.Snapshot().ActiveConnections == 0 })
-	if err := <-backendDone; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-backendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("backend relay did not close after cancellation")
 	}
 }
 

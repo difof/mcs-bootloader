@@ -39,6 +39,30 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def task_arguments(proc_root=Path("/proc"), parent_pid=None):
+    """Recover original CLI args before Task's recursive template expansion.
+
+    Task 3.44 templates both CLI_ARGS and CLI_ARGS_LIST, including literal
+    Minecraft text such as {{.FOO}}. On this Linux/systemd project the direct
+    parent is Task, so its original NUL-delimited argv is the reliable source.
+    If that contract changes, fail instead of sending guessed command text.
+    """
+    parent = proc_root / str(os.getppid() if parent_pid is None else parent_pid)
+    executable = Path(os.readlink(parent / "exe")).name.removesuffix(" (deleted)")
+    require(executable in ("task", "go-task"),
+            "cannot recover original arguments: invoke task command -- <Minecraft command>")
+    with (parent / "cmdline").open("rb") as stream:
+        raw = stream.read(2 * 1024 * 1024 + 1)
+    require(len(raw) <= 2 * 1024 * 1024 and raw.endswith(b"\0"),
+            "invoking Task argument list is incomplete or too large")
+    argv = raw[:-1].split(b"\0")
+    try:
+        separator = argv.index(b"--")
+    except ValueError:
+        return []
+    return [os.fsdecode(item) for item in argv[separator + 1:]]
+
+
 def run(argv, *, capture=False):
     result = subprocess.run([str(arg) for arg in argv], text=True,
                             capture_output=capture, check=False)
@@ -290,6 +314,8 @@ def main():
     arguments = args.arguments
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
+    if args.action == "command" and arguments == ["--task-args"]:
+        arguments = task_arguments()
     if args.action in ("_apply", "_deploy"):
         require(len(arguments) == 4, "invalid install arguments")
         source, destination, digest = arguments[:3]

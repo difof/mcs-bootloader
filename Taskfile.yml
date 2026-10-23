@@ -78,7 +78,7 @@ tasks:
     desc: 'Send a local RCON console command: task command -- op PlayerName'
     silent: true
     cmds:
-      - python3 scripts/manage.py command -- {{.CLI_ARGS}}
+      - python3 scripts/manage.py command --task-args
   logs:
     desc: Show recent gateway state and connection events
     silent: true
