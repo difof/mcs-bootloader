@@ -4,6 +4,7 @@
 import argparse
 import gzip
 import hashlib
+import html
 import io
 import json
 import os
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 ARCHITECTURES = {"amd64": 62, "arm64": 183}
 ROOT_FILES = frozenset({
-    "README.md", "CHANGELOG.md", "AGENTS.md", "Taskfile.yml", ".env.example",
+    "README.md", "AGENTS.md", "Taskfile.yml", ".env.example",
     ".gitignore", "go.mod", "go.sum", "LICENSE", "LICENSE.md",
 })
 SOURCE_SUFFIXES = {
@@ -29,8 +30,8 @@ SOURCE_SUFFIXES = {
     ".github": {".yml", ".yaml"},
 }
 REQUIRED_FILES = frozenset({
-    "README.md", "CHANGELOG.md", "AGENTS.md", "Taskfile.yml", ".env.example", "go.mod",
-    "scripts/install.py", "scripts/manage.py", "scripts/env_config.py",
+    "README.md", "AGENTS.md", "Taskfile.yml", ".env.example", "go.mod",
+    "scripts/install.py", "scripts/manage.py", "scripts/env_config.py", "scripts/service_config.py",
     "deploy/mcs-bootloader.service", "deploy/mcs-bootloader-backend.service",
     "deploy/journald@mcs-bootloader.conf",
 })
@@ -69,22 +70,39 @@ def package_files(root, tracked):
     return sorted(selected)
 
 
-def changelog_section(text, version):
-    sections = {}
-    current = None
-    for line in text.splitlines():
-        if line.startswith("## "):
-            heading = re.match(r"## \[?(Unreleased|v?\d+\.\d+\.\d+)\]?(?:\s.*)?$", line)
-            current = heading.group(1).removeprefix("v") if heading else None
-            if current:
-                sections[current] = []
-        elif current:
-            sections[current].append(line)
-    chosen = sections.get(version.removeprefix("v"), sections.get("Unreleased", []))
-    result = "\n".join(chosen).strip()
-    if not result:
-        raise ValueError("CHANGELOG.md needs release highlights under this version or Unreleased")
-    return result
+def git_changelog(version, root=ROOT):
+    """Read committed subjects since the highest earlier, reachable stable tag."""
+    current = tuple(map(int, VERSION.fullmatch(checked_version(version)).groups()))
+    if run(["git", "rev-parse", "--is-shallow-repository"], root=root) != "false":
+        raise ValueError("release changelog needs full Git history; fetch all history and tags before packaging")
+    tags = run(["git", "tag", "--merged", "HEAD", "--list", "v*"], root=root).splitlines()
+    previous = None
+    previous_number = None
+    for tag in tags:
+        match = VERSION.fullmatch(tag)
+        if match is None:
+            continue
+        number = tuple(map(int, match.groups()))
+        if number < current and (previous_number is None or number > previous_number):
+            previous, previous_number = tag, number
+    revision_range = f"{previous}..HEAD" if previous else "HEAD"
+    log = run(["git", "log", "--reverse", "--format=%H%x00%s", revision_range], root=root)
+    commits = []
+    for line in log.split("\n") if log else []:
+        commit, separator, subject = line.partition("\0")
+        if not separator or re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
+            raise ValueError("could not read release commit history")
+        commits.append((commit, subject))
+    if not commits:
+        raise ValueError("no new commits since the previous stable version tag")
+    return previous, commits
+
+
+def markdown_subject(subject):
+    """Keep a commit subject as text, never release-page markup or HTML."""
+    subject = " ".join(subject.split())
+    subject = html.escape(subject, quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+.!|~])", r"\\\1", subject)
 
 
 def validate_binary(path, architecture):
@@ -109,40 +127,22 @@ def write_archive(destination, prefix, files, epoch):
                     archive.addfile(info, io.BytesIO(data))
 
 
-def release_notes(version, highlights, metadata, repository):
+def release_notes(version, commits, metadata, repository, previous=None):
     base = f"https://github.com/{repository}"
-    return f"""## Highlights
+    changelog = "\n".join(f"- {markdown_subject(subject)} ([{commit[:12]}]({base}/commit/{commit}))"
+                          for commit, subject in commits)
+    comparison = (f"[Full diff]({base}/compare/{previous}...{version})" if previous else
+                  f"[Full history]({base}/commits/{version})")
+    source_range = f"`{previous}..{version}`" if previous else f"the complete history through `{version}`"
+    return f"""## Changelog
 
-{highlights}
+{changelog}
 
-## Downloads
+{comparison}
 
-| Linux machine | Bundle |
-| --- | --- |
-| x86-64 / amd64 | `mcs-bootloader_{version}_linux_amd64.tar.gz` |
-| ARM64 / aarch64 | `mcs-bootloader_{version}_linux_arm64.tar.gz` |
-
-Each bundle includes the static gateway binary, Task commands, installer, systemd
-templates, `.env.example`, documentation, and source. Minecraft, mods, Java, and
-world data are not bundled. The ARM64 binary is cross-compiled; automated tests
-run on amd64.
-
-## Install or update
-
-Follow the [installation and upgrade instructions]({base}/blob/{version}/README.md).
-Runtime dependencies: Linux with systemd, Python 3.10+, Task 3, sudo, tar, zstd,
-and the Java version required by your server. Go is unnecessary for binary installs.
-
-Download `SHA256SUMS` beside your chosen archive and verify it before extracting:
-
-```sh
-sha256sum --check --ignore-missing SHA256SUMS
-```
-
-First install uses `task backup` then `task install:binary` after configuring the
-private `.env` and stopping Minecraft. Updates use `task config:init`,
-`task deploy:binary`, then `task gateway:restart`. Read the upgrade notes above
-before updating an experimental installation.
+Generated automatically from Git commit subjects and links in {source_range}.
+The base is the highest earlier stable version tag reachable from the release
+commit. There is no manually maintained changelog file.
 
 ## Build details
 
@@ -150,6 +150,7 @@ before updating an experimental installation.
 - Source: [{metadata['commit'][:12]}]({base}/commit/{metadata['commit']})
 - Toolchain: `{metadata['go_toolchain']}`
 - Targets: Linux amd64 and arm64, `CGO_ENABLED=0`
+- Automated tests run on amd64; the arm64 binary is cross-compiled.
 - Included metadata: `build-info.json`; SHA-256 hashes cover both bundles and metadata.
 
 """
@@ -171,7 +172,8 @@ def package(version, root=ROOT):
     repository = os.environ.get("GITHUB_REPOSITORY", "difof/mcs-bootloader")
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
         raise ValueError("invalid GITHUB_REPOSITORY")
-    highlights = changelog_section((root / "CHANGELOG.md").read_text(), version)
+    previous, commits = git_changelog(version, root)
+    metadata["changelog_base"] = previous
     encoded_metadata = (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
     source = [(name, (root / name).read_bytes(), False) for name in files]
     source.append(("build-info.json", encoded_metadata, False))
@@ -201,7 +203,7 @@ def package(version, root=ROOT):
         checksums = "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
                             for path in sorted(assets))
         (output / "SHA256SUMS").write_text(checksums)
-        (output / "RELEASE_NOTES.md").write_text(release_notes(version, highlights, metadata, repository))
+        (output / "RELEASE_NOTES.md").write_text(release_notes(version, commits, metadata, repository, previous))
         output.rename(destination)
     print(f"Packages ready in {destination}; no tag, push, or release was created.")
 
