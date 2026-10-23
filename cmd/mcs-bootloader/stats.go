@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"time"
 )
 
 // stats is deliberately a bounded operational overview. The complete exported
@@ -25,6 +26,8 @@ func (o *cliOutput) Stats(raw []byte) error {
 		"mcs_gateway_active_connections":        {"gateway", "active_connections"},
 		"mcs_idle_remaining_seconds":            {"gateway", "idle_remaining_seconds"},
 		"mcs_metrics_cache_age_seconds":         {"gateway", "metrics_age_seconds"},
+		"process_uptime_seconds":                {"gateway", "uptime_seconds"},
+		"mcs_controller_ready_duration_seconds": {"gateway", "observed_ready_seconds"},
 		"process_resident_memory_bytes":         {"gateway", "resident_memory_bytes"},
 		"go_goroutines":                         {"gateway", "goroutines"},
 		"mcs_rcon_connected":                    {"rcon", "connected"},
@@ -33,6 +36,14 @@ func (o *cliOutput) Stats(raw []byte) error {
 		"mcs_rcon_connection_errors_total":      {"rcon", "connection_errors_total"},
 		"mcs_minecraft_players_online":          {"minecraft", "players_online"},
 		"mcs_minecraft_players_capacity":        {"minecraft", "players_capacity"},
+		"mcs_minecraft_uptime_seconds":          {"minecraft", "uptime_seconds"},
+		"mcs_startup_estimate_known":            {"startup", "estimate_known"},
+		"mcs_startup_estimate_seconds":          {"startup", "estimate_seconds"},
+		"mcs_startup_duration_seconds":          {"startup", "last_duration_seconds"},
+		"mcs_startup_successes_total":           {"startup", "successful_boots"},
+		"mcs_startup_elapsed_seconds":           {"startup", "elapsed_seconds"},
+		"mcs_startup_remaining_seconds":         {"startup", "remaining_seconds"},
+		"mcs_startup_estimate_overdue":          {"startup", "estimate_overdue"},
 		"mcs_minecraft_tick_target_rate_hertz":  {"minecraft", "target_tick_rate_hertz"},
 		"mcs_minecraft_tick_duration_seconds":   {"minecraft", "mean_tick_duration_seconds"},
 		"mcs_whitelist_known":                   {"minecraft", "whitelist_known"},
@@ -103,6 +114,18 @@ func humanizeStats(values map[string]any) {
 		if strings.HasSuffix(key, "_bytes") {
 			values[key] = formatBytes(number)
 		}
+		if humanDurationKey(key) && number >= 0 && number < float64(1<<63-1)/float64(time.Second) {
+			values[key] = (time.Duration(number * float64(time.Second))).Round(time.Second).String()
+		}
+	}
+}
+
+func humanDurationKey(key string) bool {
+	switch key {
+	case "uptime_seconds", "observed_ready_seconds", "idle_remaining_seconds", "metrics_age_seconds", "sample_age_seconds", "estimate_seconds", "last_duration_seconds", "elapsed_seconds", "remaining_seconds":
+		return true
+	default:
+		return false
 	}
 }
 func formatBytes(value float64) string {

@@ -73,6 +73,8 @@ Failed or unavailable server readings are omitted rather than represented as zer
 | `mcs_gateway_active_connections` | Active/pending backend join reservations. |
 | `mcs_controller_last_check_timestamp_seconds`, `mcs_controller_last_success_timestamp_seconds`, `mcs_controller_check_age_seconds` | Lifecycle health-check freshness. |
 | `mcs_backend_started_timestamp_seconds`, `mcs_backend_stopping_timestamp_seconds`, `mcs_next_wake_timestamp_seconds` | Recorded lifecycle times, when present. |
+| `mcs_minecraft_start_time_seconds`, `mcs_minecraft_uptime_seconds` | Verified Java process start time and elapsed uptime, including loading and shutdown. Gateway restarts do not reset these values. |
+| `mcs_controller_ready_since_timestamp_seconds`, `mcs_controller_ready_duration_seconds` | Current uninterrupted ready period observed by this gateway. A gateway restart begins a new observation; this is separate from Java uptime. |
 | `mcs_idle_timeout_seconds`, `mcs_idle_since_timestamp_seconds`, `mcs_idle_deadline_timestamp_seconds`, `mcs_idle_remaining_seconds` | Current idle policy and applicable deadline. |
 | `mcs_gateway_bytes_total{direction}` | Relayed game bytes, `to_backend`/`to_client`, including successfully replayed login frames. Local status/denial replies are excluded. |
 
@@ -81,6 +83,22 @@ Gateway counters use the prefix `mcs_gateway_` and suffix `_total`:
 `accepted_connections`, `capacity_rejections`, `invalid_requests`, `status_requests`, `login_requests`, `wake_requests`, `wake_limited`, `routed_connections`, `backend_errors`, `whitelist_denied`, `whitelist_errors`, `draining_rejections`.
 
 Metrics configuration is exported as `mcs_metrics_enabled`, `mcs_metrics_poll_interval_seconds`, `mcs_metrics_player_interval_seconds` and `mcs_metrics_player_details_enabled`. HTTP instrumentation is `mcs_metrics_http_requests_total`, `mcs_metrics_http_errors_total` and `mcs_metrics_http_duration_seconds_total`.
+
+### Startup estimates
+
+Successful complete boots teach the gateway how long loading normally takes. The private boot-history cache survives gateway restarts. A failed boot or adopting an already-running server does not count as a successful observed boot. Readiness polling adds up to one poll interval to an observed duration under normal operation.
+
+| Metric | Meaning |
+| --- | --- |
+| `mcs_startup_estimate_known` | Whether successful boot history provides an estimate. |
+| `mcs_startup_successes_total` | Complete successful boots observed and retained in the cache; resets if the cache is removed or invalid. |
+| `mcs_startup_duration_seconds` | Last complete successful boot duration. Absent before the first observation. |
+| `mcs_startup_estimate_seconds` | Smoothed estimate: first observed duration, then 75% previous estimate + 25% newest duration. |
+| `mcs_startup_started_timestamp_seconds`, `mcs_startup_elapsed_seconds` | Current gateway-initiated attempt start time and elapsed loading time; present only while starting. |
+| `mcs_startup_remaining_seconds` | Learned estimate minus the current attempt's elapsed time, clamped at zero. Absent if no estimate or current attempt is known. |
+| `mcs_startup_estimate_overdue` | One when loading has reached or exceeded the estimate. Zero remaining does **not** mean ready. |
+
+Uptime and countdown gauges advance between background polls using cached timestamps; scrapes do no extra process or disk reads. Java uptime is absent while the backend is stopped/unknown, its PID changed, or the latest process sample is unavailable. The server can take longer than its estimate after a mod/configuration change. Use `mcs_controller_ready` to determine readiness. `mcs_backend_started_timestamp_seconds` is the lifecycle controller's recorded start/adoption time, so use `mcs_minecraft_start_time_seconds` for actual Java uptime.
 
 ### Directory sizes
 
@@ -163,7 +181,7 @@ Metrics under `mcs_jvm_process_` describe the configured backend's Java main pro
 
 `pid`, `cpu_seconds_total`, `start_time_seconds`, `resident_memory_bytes`, `virtual_memory_bytes`, `threads`, `open_fds`, `max_fds`, `swap_bytes`, `data_memory_bytes`, `stack_memory_bytes`, `context_switches_total{kind}`.
 
-Optional I/O metrics are `io_read_bytes_total`, `io_written_bytes_total`, `io_read_characters_total`, `io_written_characters_total`, `io_read_calls_total`, `io_write_calls_total`. Missing procfs permissions omit the unavailable fields. CPU seconds are cumulative user+system time; use `rate()` to measure CPU usage. Uptime is `time() - mcs_jvm_process_start_time_seconds`.
+Optional I/O metrics are `io_read_bytes_total`, `io_written_bytes_total`, `io_read_characters_total`, `io_written_characters_total`, `io_read_calls_total`, `io_write_calls_total`. Missing procfs permissions omit the unavailable fields. CPU seconds are cumulative user+system time; use `rate()` to measure CPU usage. `mcs_minecraft_uptime_seconds` provides elapsed Java uptime from the same verified process start timestamp.
 
 HotSpot shared perfdata provides:
 
@@ -187,7 +205,7 @@ If the backend's main process is a wrapper rather than Java, procfs access is de
 
 ### Gateway's own Go process
 
-`process_` exports the same Linux accounting suffixes listed for `mcs_jvm_process_`. `go_info{version}`, `go_goroutines`, `go_threads` and `go_gomaxprocs` describe the Go runtime.
+`process_` exports the same Linux accounting suffixes listed for `mcs_jvm_process_`, plus `process_uptime_seconds` from the cached process start timestamp. `go_info{version}`, `go_goroutines`, `go_threads` and `go_gomaxprocs` describe the Go runtime.
 
 Memory metrics use `go_memstats_`: `alloc_bytes`, `alloc_bytes_total`, `sys_bytes`, `mallocs_total`, `frees_total`, `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_inuse_bytes`, `heap_released_bytes`, `heap_objects`, `stack_inuse_bytes`, `stack_sys_bytes`, `mspan_inuse_bytes`, `mcache_inuse_bytes`, `gc_sys_bytes`, `next_gc_bytes`.
 
@@ -201,6 +219,12 @@ rate(mcs_jvm_process_cpu_seconds_total[5m])
 
 # Used JVM heap, summing actual heap spaces
 sum by (instance) (mcs_jvm_memory_pool_used_bytes)
+
+# Minecraft uptime in hours, unchanged when the gateway restarts
+mcs_minecraft_uptime_seconds / 3600
+
+# Loading attempts that have exceeded their learned estimate
+mcs_startup_estimate_overdue == 1
 
 # Failed collectors that should currently be available
 (mcs_metrics_collector_expected == 1)

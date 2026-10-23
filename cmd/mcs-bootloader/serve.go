@@ -93,6 +93,13 @@ func serveWithOutput(configPath string, output *cliOutput) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		log.Warn("status_cache_unavailable", "error", err.Error())
 	}
+	if history, err := readBootCache(filepath.Join(cfg.StateDirectory, "boot-history.json")); err == nil {
+		if err := c.RestoreBootHistory(history); err != nil {
+			log.Warn("boot_history_unavailable", "error", err.Error())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Warn("boot_history_unavailable", "error", err.Error())
+	}
 	s := gateway.New(trafficConfig(cfg), c, log)
 	runtime := &runtimeConfig{cfg: cfg.Clone(), path: configPath, digest: digest, generation: 1,
 		controller: c, gateway: s, backend: b, level: level, log: log}
@@ -231,25 +238,36 @@ func readCache(path string) (json.RawMessage, error) {
 func persistCache(ctx context.Context, c *control.Controller, path string, log *slog.Logger) {
 	timer := time.NewTicker(10 * time.Second)
 	defer timer.Stop()
-	var last []byte
-	var lastError string
+	type cache struct {
+		name, path string
+		read       func() []byte
+		last       []byte
+		lastError  string
+	}
+	caches := []cache{
+		{name: "status_cache", path: path, read: func() []byte { return c.CachedStatus() }},
+		{name: "boot_history", path: filepath.Join(filepath.Dir(path), "boot-history.json"), read: c.CachedBootHistory},
+	}
 	write := func() {
-		data := c.CachedStatus()
-		if len(data) == 0 || bytes.Equal(last, data) {
-			return
-		}
-		if err := atomicWrite(path, data); err != nil {
-			if err.Error() != lastError {
-				log.Warn("status_cache_write_failed", "error", err.Error())
-				lastError = err.Error()
+		for i := range caches {
+			entry := &caches[i]
+			data := entry.read()
+			if len(data) == 0 || bytes.Equal(entry.last, data) {
+				continue
 			}
-			return
+			if err := atomicWrite(entry.path, data); err != nil {
+				if err.Error() != entry.lastError {
+					log.Warn(entry.name+"_write_failed", "error", err.Error())
+					entry.lastError = err.Error()
+				}
+				continue
+			}
+			if entry.lastError != "" {
+				log.Info(entry.name + "_recovered")
+				entry.lastError = ""
+			}
+			entry.last = append(entry.last[:0], data...)
 		}
-		if lastError != "" {
-			log.Info("status_cache_recovered")
-			lastError = ""
-		}
-		last = append(last[:0], data...)
 	}
 	for {
 		select {
@@ -262,8 +280,31 @@ func persistCache(ctx context.Context, c *control.Controller, path string, log *
 	}
 }
 
+func readBootCache(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 {
+		return nil, errors.New("boot history must be a private regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 4096 {
+		return nil, errors.New("boot history exceeds size limit")
+	}
+	return data, nil
+}
+
 func atomicWrite(path string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".status-*")
+	f, err := os.CreateTemp(filepath.Dir(path), ".cache-*")
 	if err != nil {
 		return err
 	}

@@ -17,12 +17,13 @@ import (
 )
 
 type Systemd struct {
-	Service  string
-	Address  string
-	Protocol int
-	RCON     *rcon.Client
-	mu       sync.RWMutex
-	mainPID  atomic.Int64
+	Service    string
+	Address    string
+	Protocol   int
+	RCON       *rcon.Client
+	mu         sync.RWMutex
+	mainPID    atomic.Int64
+	invocation atomic.Pointer[string]
 }
 
 func (s *Systemd) Start(ctx context.Context) error {
@@ -32,11 +33,16 @@ func (s *Systemd) Start(ctx context.Context) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("start backend service: %w: %.2048s", err, strings.TrimSpace(string(out)))
 	}
+	// Capture the service invocation before returning to the controller so a
+	// later independent restart cannot be learned as this startup. Failure to
+	// inspect does not undo a successful start; it merely disables that sample.
+	_, _ = s.Running(ctx)
 	return nil
 }
 
 func (s *Systemd) Running(ctx context.Context) (bool, error) {
-	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", s.Service, "--property=LoadState", "--property=ActiveState", "--property=MainPID")
+	s.invocation.Store(nil)
+	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", s.Service, "--property=LoadState", "--property=ActiveState", "--property=MainPID", "--property=InvocationID")
 	out, err := cmd.Output()
 	if err != nil {
 		s.mainPID.Store(0)
@@ -60,6 +66,9 @@ func (s *Systemd) Running(ctx context.Context) (bool, error) {
 	s.mainPID.Store(pid)
 	switch values["ActiveState"] {
 	case "active", "activating", "reloading", "refreshing":
+		if id := values["InvocationID"]; validInvocationID(id) {
+			s.invocation.Store(&id)
+		}
 		return true, nil
 	case "deactivating":
 		return true, fmt.Errorf("backend service is stopping")
@@ -75,6 +84,27 @@ func (s *Systemd) Running(ctx context.Context) (bool, error) {
 // MainPID is the last lifecycle inspection's PID; it never starts a process or
 // queries systemd during a metrics scrape. Collectors verify /proc start time.
 func (s *Systemd) MainPID() int { return int(s.mainPID.Load()) }
+
+// ProcessIdentity is systemd's per-service-start identifier, cached by Running.
+// It has no wall-clock or PID-reuse ambiguity and performs no I/O.
+func (s *Systemd) ProcessIdentity() string {
+	if id := s.invocation.Load(); id != nil {
+		return *id
+	}
+	return ""
+}
+
+func validInvocationID(value string) bool {
+	if len(value) != 32 || value == strings.Repeat("0", 32) {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 func (s *Systemd) RCONStats() rcon.Stats {
 	s.mu.RLock()

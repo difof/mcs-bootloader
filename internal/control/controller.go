@@ -81,18 +81,23 @@ func (cfg Config) Validate() error {
 }
 
 type Snapshot struct {
-	State               State     `json:"state"`
-	Players             *int      `json:"players"`
-	ActiveConnections   int       `json:"active_connections"`
-	BackendRunning      bool      `json:"backend_running"`
-	BackendKnown        bool      `json:"backend_known"`
-	IdleSince           time.Time `json:"idle_since,omitempty"`
-	StartedAt           time.Time `json:"started_at,omitempty"`
-	StoppingSince       time.Time `json:"stopping_since,omitempty"`
-	LastCheck           time.Time `json:"last_check,omitempty"`
-	LastSuccessfulCheck time.Time `json:"last_successful_check,omitempty"`
-	NextWakeAt          time.Time `json:"next_wake_at,omitempty"`
-	LastError           string    `json:"last_error,omitempty"`
+	State                   State     `json:"state"`
+	Players                 *int      `json:"players"`
+	ActiveConnections       int       `json:"active_connections"`
+	BackendRunning          bool      `json:"backend_running"`
+	BackendKnown            bool      `json:"backend_known"`
+	IdleSince               time.Time `json:"idle_since,omitempty"`
+	StartedAt               time.Time `json:"started_at,omitempty"`
+	StoppingSince           time.Time `json:"stopping_since,omitempty"`
+	LastCheck               time.Time `json:"last_check,omitempty"`
+	LastSuccessfulCheck     time.Time `json:"last_successful_check,omitempty"`
+	NextWakeAt              time.Time `json:"next_wake_at,omitempty"`
+	LastError               string    `json:"last_error,omitempty"`
+	BootStartedAt           time.Time `json:"boot_started_at,omitempty"`
+	ReadySince              time.Time `json:"ready_since,omitempty"`
+	BootEstimateSeconds     float64   `json:"boot_estimate_seconds,omitempty"`
+	LastBootDurationSeconds float64   `json:"last_boot_duration_seconds,omitempty"`
+	SuccessfulBoots         uint64    `json:"successful_boots,omitempty"`
 }
 
 type request struct {
@@ -123,13 +128,16 @@ type Controller struct {
 	done    chan struct{}
 	started atomic.Bool
 	// The following fields belong exclusively to Run's worker.
-	wasReady      bool
-	reportedError string
+	wasReady        bool
+	reportedError   string
+	now             func() time.Time
+	bootLearning    bool
+	processIdentity string
 }
 
 func New(cfg Config, backend Backend, logger *slog.Logger) *Controller {
 	if cfg.IdleTimeout <= 0 {
-		cfg.IdleTimeout = time.Hour
+		cfg.IdleTimeout = 15 * time.Minute
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 15 * time.Second
@@ -150,7 +158,7 @@ func New(cfg Config, backend Backend, logger *slog.Logger) *Controller {
 		logger = slog.Default()
 	}
 	return &Controller{
-		cfg: cfg, backend: backend, logger: logger,
+		cfg: cfg, backend: backend, logger: logger, now: time.Now,
 		snap: Snapshot{State: Unknown}, reqs: make(chan request, 64), done: make(chan struct{}),
 	}
 }
@@ -364,30 +372,45 @@ func (c *Controller) wake(ctx context.Context) error {
 	if running {
 		// Includes a server that is still booting after a warning timeout, or
 		// one started independently while the gateway was asleep.
-		if s.State == Asleep {
+		changed := c.observeProcess()
+		if s.State == Asleep || changed {
 			c.wasReady = false
+			c.bootLearning = false
 			c.update(Starting, "adopting running backend", func(s *Snapshot) {
 				s.BackendRunning, s.BackendKnown = true, true
-				s.StartedAt = time.Now()
+				s.StartedAt = c.now()
+				s.BootStartedAt, s.ReadySince = time.Time{}, time.Time{}
 				s.Players, s.IdleSince = nil, time.Time{}
 			})
 		}
 		return nil
 	}
-	if time.Now().Before(s.NextWakeAt) {
+	if c.now().Before(s.NextWakeAt) {
 		return ErrCooldown
 	}
 	c.wasReady = false
-	now := time.Now()
+	c.bootLearning = true
+	c.processIdentity = ""
+	now := c.now()
 	c.update(Starting, "wake requested", func(s *Snapshot) {
 		s.BackendRunning, s.BackendKnown = false, true
 		s.Players, s.IdleSince = nil, time.Time{}
 		s.StartedAt, s.NextWakeAt = now, now.Add(c.cfg.WakeCooldown)
+		s.BootStartedAt, s.ReadySince = now, time.Time{}
 		s.StoppingSince, s.LastError = time.Time{}, ""
 	})
 	if err := c.backend.Start(op); err != nil {
+		c.bootLearning = false
 		c.unhealthy(Failed, "backend start failed", err, true)
 		return fmt.Errorf("start backend: %w", err)
+	}
+	// A concrete backend can capture its process identity while starting. If
+	// it cannot, skip learning rather than timing a later unrelated process.
+	if identified, ok := c.backend.(processIdentifiedBackend); ok {
+		c.processIdentity = identified.ProcessIdentity()
+		if c.processIdentity == "" {
+			c.bootLearning = false
+		}
 	}
 	return nil
 }
@@ -406,6 +429,8 @@ func (c *Controller) poll(ctx context.Context) {
 		return
 	}
 	if !running {
+		c.wasReady, c.bootLearning = false, false
+		c.processIdentity = ""
 		state, reason := Asleep, "backend is stopped"
 		message := ""
 		if s.State == Failed {
@@ -415,10 +440,11 @@ func (c *Controller) poll(ctx context.Context) {
 		}
 		c.update(state, reason, func(s *Snapshot) {
 			s.BackendRunning, s.BackendKnown = false, true
+			s.BootStartedAt = time.Time{}
 			s.Players, s.IdleSince = nil, time.Time{}
-			s.LastCheck, s.LastError = time.Now(), message
+			s.LastCheck, s.LastError = c.now(), message
 			if state == Failed && reason == "backend exited unexpectedly" {
-				s.NextWakeAt = time.Now().Add(c.cfg.WakeCooldown)
+				s.NextWakeAt = c.now().Add(c.cfg.WakeCooldown)
 			}
 			if state == Asleep {
 				s.StoppingSince = time.Time{}
@@ -427,15 +453,25 @@ func (c *Controller) poll(ctx context.Context) {
 		c.reportError(message)
 		return
 	}
+	changed := c.observeProcess()
+	if changed {
+		c.wasReady = false
+		c.update(Starting, "backend process changed", func(s *Snapshot) {
+			s.StartedAt, s.BootStartedAt = c.now(), time.Time{}
+			s.Players, s.IdleSince, s.StoppingSince = nil, time.Time{}, time.Time{}
+		})
+		s = c.Snapshot()
+	}
 	c.mu.Lock()
 	c.snap.BackendRunning, c.snap.BackendKnown = true, true
-	if c.snap.StartedAt.IsZero() || s.State == Asleep {
-		c.snap.StartedAt = time.Now()
+	if c.snap.StartedAt.IsZero() || s.State == Asleep || (!s.BackendRunning && !c.bootLearning) {
+		c.snap.StartedAt = c.now()
+		c.snap.BootStartedAt, c.snap.ReadySince = time.Time{}, time.Time{}
 		c.wasReady = false
 	}
 	c.mu.Unlock()
 	if s.State == Stopping {
-		if !s.StoppingSince.IsZero() && time.Since(s.StoppingSince) >= c.cfg.ShutdownWarnAfter {
+		if !s.StoppingSince.IsZero() && c.now().Sub(s.StoppingSince) >= c.cfg.ShutdownWarnAfter {
 			msg := "graceful shutdown is taking longer than expected; waiting without sending signals"
 			c.update(Stopping, "waiting for graceful shutdown", func(s *Snapshot) { s.LastError = msg })
 			c.reportError(msg)
@@ -458,11 +494,20 @@ func (c *Controller) poll(ctx context.Context) {
 		c.notReady(fmt.Errorf("server status: %w", err))
 		return
 	}
+	if !c.wasReady && c.bootLearning && !c.verifyBootProcess(op) {
+		return
+	}
+	now := c.now()
+	if !c.wasReady {
+		c.recordSuccessfulBoot(now)
+	}
 	c.wasReady = true
-	now := time.Now()
 	c.update(Ready, "backend ready", func(s *Snapshot) {
 		s.Players = &players
 		s.LastCheck, s.LastSuccessfulCheck, s.LastError = now, now, ""
+		if s.ReadySince.IsZero() {
+			s.ReadySince = now
+		}
 		if players > 0 || s.ActiveConnections > 0 {
 			s.IdleSince = time.Time{}
 		} else if s.IdleSince.IsZero() {
@@ -471,7 +516,7 @@ func (c *Controller) poll(ctx context.Context) {
 	})
 	c.reportError("")
 	s = c.Snapshot()
-	if !s.IdleSince.IsZero() && time.Since(s.IdleSince) >= c.cfg.IdleTimeout {
+	if !s.IdleSince.IsZero() && c.now().Sub(s.IdleSince) >= c.cfg.IdleTimeout {
 		_ = c.sleep(ctx, true)
 	}
 }
@@ -481,7 +526,7 @@ func (c *Controller) notReady(err error) {
 	s := c.Snapshot()
 	if c.wasReady {
 		state, report = Unknown, true
-	} else if !s.StartedAt.IsZero() && time.Since(s.StartedAt) >= c.cfg.StartupTimeout {
+	} else if !s.StartedAt.IsZero() && c.now().Sub(s.StartedAt) >= c.cfg.StartupTimeout {
 		state, report = Failed, true
 		err = fmt.Errorf("startup readiness timeout; backend left running: %w", err)
 	}
@@ -508,12 +553,13 @@ func (c *Controller) sleep(ctx context.Context, automatic bool) error {
 		c.mu.Unlock()
 		return ErrUnknownPlayers
 	}
-	if automatic && (s.IdleSince.IsZero() || time.Since(s.IdleSince) < c.cfg.IdleTimeout) {
+	if automatic && (s.IdleSince.IsZero() || c.now().Sub(s.IdleSince) < c.cfg.IdleTimeout) {
 		c.mu.Unlock()
 		return ErrBusy
 	}
-	c.snap.State, c.snap.StoppingSince = Stopping, time.Now()
+	c.snap.State, c.snap.StoppingSince = Stopping, c.now()
 	c.snap.IdleSince = time.Time{}
+	c.snap.ReadySince = time.Time{}
 	c.mu.Unlock()
 	reason := "manual sleep requested"
 	if automatic {
@@ -535,12 +581,13 @@ func (c *Controller) sleep(ctx context.Context, automatic bool) error {
 	if players != 0 {
 		c.update(Ready, "player joined; shutdown cancelled", func(s *Snapshot) {
 			s.Players, s.StoppingSince = &players, time.Time{}
-			s.LastCheck, s.LastSuccessfulCheck = time.Now(), time.Now()
+			s.LastCheck, s.LastSuccessfulCheck = c.now(), c.now()
+			s.ReadySince = c.now()
 		})
 		return ErrBusy
 	}
 	c.update(Stopping, "sending graceful stop", func(s *Snapshot) {
-		s.LastCheck, s.LastSuccessfulCheck = time.Now(), time.Now()
+		s.LastCheck, s.LastSuccessfulCheck = c.now(), c.now()
 		s.Players = &players
 	})
 	if err := c.backend.Stop(op); err != nil {
@@ -555,7 +602,7 @@ func (c *Controller) sleep(ctx context.Context, automatic bool) error {
 func (c *Controller) unhealthy(state State, reason string, err error, report bool) {
 	c.update(state, reason, func(s *Snapshot) {
 		s.Players, s.IdleSince = nil, time.Time{}
-		s.LastCheck, s.LastError = time.Now(), err.Error()
+		s.LastCheck, s.LastError = c.now(), err.Error()
 		if reason == "cannot determine backend state" {
 			s.BackendKnown = false
 		}
@@ -574,6 +621,9 @@ func (c *Controller) update(state State, reason string, mutate func(*Snapshot)) 
 	}
 	mutate(&c.snap)
 	c.snap.State = state
+	if state != Ready {
+		c.snap.ReadySince = time.Time{}
+	}
 	players := -1
 	if c.snap.Players != nil {
 		players = *c.snap.Players

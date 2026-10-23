@@ -155,7 +155,7 @@ func New(cfg Config, controller Controller, logger *slog.Logger) *Server {
 		cfg.DialTimeout = 3 * time.Second
 	}
 	if cfg.BootMessage == "" {
-		cfg.BootMessage = "Server is booting up. Please reconnect shortly."
+		cfg.BootMessage = "Server is booting up. {eta} Please reconnect."
 	}
 	if cfg.SleepingMOTD == "" {
 		cfg.SleepingMOTD = "Sleeping - join to start the server"
@@ -438,7 +438,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, cfg Config) {
 		if s.rejectDraining(conn, handshake.Protocol) {
 			return
 		}
-		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, disconnectMessage(cfg, s.controller.Snapshot().State))
+		_ = mcproto.WriteDisconnect(conn, handshake.Protocol, disconnectMessage(cfg, s.controller.Snapshot(), time.Now()))
 		return
 	}
 	defer release()
@@ -492,10 +492,10 @@ func (s *Server) rejectDraining(conn net.Conn, protocol int) bool {
 	return true
 }
 
-func disconnectMessage(cfg Config, state control.State) string {
-	switch state {
+func disconnectMessage(cfg Config, snapshot control.Snapshot, now time.Time) string {
+	switch snapshot.State {
 	case control.Asleep, control.Starting:
-		return cfg.BootMessage
+		return bootMessage(cfg.BootMessage, snapshot, now)
 	case control.Stopping:
 		return cfg.StoppingMOTD
 	case control.Unknown:

@@ -132,6 +132,7 @@ func (m *Manager) points(cfg Config, cache collection, snapshot Snapshot, stats 
 	for _, state := range []control.State{control.Unknown, control.Asleep, control.Starting, control.Ready, control.Stopping, control.Failed} {
 		points = append(points, gauge("mcs_controller_state", "Current lifecycle state as a one-hot gauge.", boolean(s.State == state), "state", string(state)))
 	}
+	points = append(points, lifecycleTimingPoints(s, now)...)
 	if s.BackendKnown {
 		points = append(points, gauge("mcs_backend_running", "Whether the supervised backend service is running.", boolean(s.BackendRunning)))
 	}
@@ -216,6 +217,9 @@ func (m *Manager) points(cfg Config, cache collection, snapshot Snapshot, stats 
 		}
 		if allow {
 			points = append(points, cache.Points[name]...)
+			if h.Success {
+				points = append(points, processUptimePoints(name, cache.Points[name], now)...)
+			}
 		}
 	}
 	points = append(points, m.directoryPoints(cfg)...)
